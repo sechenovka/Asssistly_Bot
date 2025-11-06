@@ -1,0 +1,665 @@
+# Monorepo структура
+
+```
+/ danika
+  /apps
+    /api            # NestJS API (webhooks, auth, billing webhooks, CRUD)
+    /bot            # Telegraf bot worker (LLM ответы, очереди)
+    /web            # Next.js кабинет (Login Widget, чаты, подписка)
+  /packages
+    /db             # Prisma schema + клиент
+    /shared         # общие типы/утилиты
+  .env.example
+  package.json
+  pnpm-workspace.yaml
+  README.md
+```
+
+---
+
+## package.json (root)
+```json
+{
+  "name": "danika",
+  "private": true,
+  "packageManager": "pnpm@9.6.0",
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "build": "pnpm -r build",
+    "start": "pnpm -r start",
+    "db:push": "pnpm --filter @danika/db prisma db push",
+    "db:studio": "pnpm --filter @danika/db prisma studio"
+  },
+  "devDependencies": {
+    "turbo": "^2.1.0"
+  }
+}
+```
+
+## pnpm-workspace.yaml
+```yaml
+packages:
+  - apps/*
+  - packages/*
+```
+
+## .env.example
+```
+# Общие
+NODE_ENV=development
+OPENAI_API_KEY=sk-...
+APP_URL=http://localhost:3000
+
+# Telegram Bot API
+TELEGRAM_BOT_TOKEN=123456:ABCDEF
+TELEGRAM_BOT_USERNAME=danika_bot
+TELEGRAM_LOGIN_BOT_TOKEN=123456:ABCDEF  # тот же, для верификации Login Widget
+TELEGRAM_WEBHOOK_SECRET=super-secret
+PUBLIC_TELEGRAM_BOT_USERNAME=danika_bot  # для фронта
+
+# БД
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/danika
+
+# Billing (позже можно YooKassa/CloudPayments)
+STRIPE_SECRET_KEY=sk_live_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+STRIPE_PRICE_STARTER=price_...
+STRIPE_PRICE_PRO=price_...
+```
+
+---
+
+# packages/db
+
+## packages/db/package.json
+```json
+{
+  "name": "@danika/db",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "prisma": {
+    "seed": "node prisma/seed.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.17.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.17.0"
+  }
+}
+```
+
+## packages/db/prisma/schema.prisma
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String   @id @default(cuid())
+  tgId            BigInt   @unique
+  tgUsername      String?  @db.VarChar(64)
+  firstName       String?  @db.VarChar(128)
+  lastName        String?  @db.VarChar(128)
+  photoUrl        String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  subscriptions   Subscription[]
+  bots            Bot[]
+}
+
+model Bot {
+  id          String   @id @default(cuid())
+  ownerId     String
+  owner       User     @relation(fields: [ownerId], references: [id])
+  tokenEnc    String   // зашифрованный токен
+  username    String
+  createdAt   DateTime @default(now())
+  chats       Chat[]
+}
+
+model Chat {
+  id        String   @id @default(cuid())
+  chatId    String   // telegram chat id (as string)
+  title     String?
+  type      String   // private | group | supergroup | channel
+  botId     String
+  bot       Bot      @relation(fields: [botId], references: [id])
+  settings  ChatSettings?
+  createdAt DateTime @default(now())
+}
+
+model ChatSettings {
+  id          String  @id @default(cuid())
+  chatId      String  @unique
+  chat        Chat    @relation(fields: [chatId], references: [id])
+  enabled     Boolean @default(false)
+  prompt      String  @default("")
+  temperature Float   @default(0.7)
+  maxTokens   Int     @default(512)
+  language    String  @default("auto")
+}
+
+model Subscription {
+  id               String   @id @default(cuid())
+  userId           String
+  user             User     @relation(fields: [userId], references: [id])
+  provider         String   // stripe
+  plan             String   // starter|pro
+  status           String   // active|past_due|canceled
+  currentPeriodEnd DateTime
+  createdAt        DateTime @default(now())
+}
+
+model UsageLog {
+  id        String   @id @default(cuid())
+  chatId    String
+  tokens    Int
+  createdAt DateTime @default(now())
+}
+```
+
+## packages/db/src/index.ts
+```ts
+import { PrismaClient } from "@prisma/client";
+export const prisma = new PrismaClient();
+```
+
+---
+
+# packages/shared
+
+## packages/shared/package.json
+```json
+{
+  "name": "@danika/shared",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module"
+}
+```
+
+## packages/shared/src/telegramLogin.ts
+```ts
+import crypto from "node:crypto";
+
+// Валидация данных Telegram Login Widget
+// https://core.telegram.org/widgets/login#checking-authorization
+export function validateTelegramAuth(data: Record<string, string>, botToken: string) {
+  const { hash, ...rest } = data;
+  const checkString = Object.keys(rest)
+    .sort()
+    .map((k) => `${k}=${rest[k]}`)
+    .join("\n");
+
+  const secret = crypto.createHmac("sha256", "WebAppData").update(botToken).digest();
+  const _hash = crypto.createHmac("sha256", secret).update(checkString).digest("hex");
+  return _hash === hash;
+}
+```
+
+---
+
+# apps/api (NestJS)
+
+## apps/api/package.json
+```json
+{
+  "name": "@danika/api",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "nest start --watch",
+    "build": "nest build",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@danika/db": "*",
+    "@danika/shared": "*",
+    "@nestjs/common": "^10.3.0",
+    "@nestjs/core": "^10.3.0",
+    "@nestjs/platform-express": "^10.3.0",
+    "body-parser": "^1.20.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pino": "^9.0.0",
+    "reflect-metadata": "^0.2.2"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^10.3.0",
+    "@nestjs/schematics": "^10.1.0",
+    "@nestjs/testing": "^10.3.0",
+    "typescript": "^5.5.4"
+  }
+}
+```
+
+## apps/api/src/main.ts
+```ts
+import 'dotenv/config';
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './modules/app.module.js';
+import bodyParser from 'body-parser';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule, { cors: true });
+  app.use(bodyParser.json({ limit: '1mb' }));
+  const port = process.env.API_PORT || 4000;
+  await app.listen(port as number);
+  console.log(`API listening on :${port}`);
+}
+bootstrap();
+```
+
+## apps/api/src/modules/app.module.ts
+```ts
+import { Module } from '@nestjs/common';
+import { AuthController } from './auth.controller.js';
+import { WebhookController } from './webhook.controller.js';
+import { ChatsController } from './chats.controller.js';
+import { BillingController } from './billing.controller.js';
+
+@Module({
+  controllers: [AuthController, WebhookController, ChatsController, BillingController],
+})
+export class AppModule {}
+```
+
+## apps/api/src/modules/auth.controller.ts
+```ts
+import { Controller, Post, Body, BadRequestException } from '@nestjs/common';
+import { prisma } from '@danika/db/src/index.js';
+import { validateTelegramAuth } from '@danika/shared/src/telegramLogin.js';
+
+@Controller('auth')
+export class AuthController {
+  @Post('telegram')
+  async telegramLogin(@Body() body: any) {
+    const ok = validateTelegramAuth(body, process.env.TELEGRAM_LOGIN_BOT_TOKEN!);
+    if (!ok) throw new BadRequestException('Invalid Telegram auth');
+
+    const tgId = BigInt(body.id);
+    const user = await prisma.user.upsert({
+      where: { tgId },
+      update: {
+        tgUsername: body.username ?? null,
+        firstName: body.first_name ?? null,
+        lastName: body.last_name ?? null,
+        photoUrl: body.photo_url ?? null,
+      },
+      create: {
+        tgId,
+        tgUsername: body.username ?? null,
+        firstName: body.first_name ?? null,
+        lastName: body.last_name ?? null,
+        photoUrl: body.photo_url ?? null,
+      },
+    });
+    return { token: `demo.${user.id}`, user: { id: user.id, username: user.tgUsername } };
+  }
+}
+```
+
+## apps/api/src/modules/chats.controller.ts
+```ts
+import { Controller, Get, Param, Post, Body, Put } from '@nestjs/common';
+import { prisma } from '@danika/db/src/index.js';
+
+@Controller('chats')
+export class ChatsController {
+  @Get(':userId')
+  async list(@Param('userId') userId: string) {
+    // Список чатов, которыми владеет user через его бота(ов)
+    const bots = await prisma.bot.findMany({ where: { ownerId: userId }, include: { chats: { include: { settings: true } } } });
+    return bots.flatMap(b => b.chats);
+  }
+
+  @Put(':chatId/settings')
+  async updateSettings(@Param('chatId') chatId: string, @Body() dto: any) {
+    const { enabled, prompt, temperature, maxTokens } = dto;
+    const settings = await prisma.chatSettings.upsert({
+      where: { chatId },
+      update: { enabled, prompt, temperature, maxTokens },
+      create: { chatId, enabled: !!enabled, prompt: prompt ?? '' }
+    });
+    return settings;
+  }
+}
+```
+
+## apps/api/src/modules/webhook.controller.ts (webhook для событий от бота)
+```ts
+import { Controller, Post, Headers, Body } from '@nestjs/common';
+import { prisma } from '@danika/db/src/index.js';
+import fetch from 'node-fetch';
+
+@Controller('telegram')
+export class WebhookController {
+  @Post('webhook')
+  async webhook(@Headers('x-telegram-bot-api-secret-token') secret: string, @Body() update: any) {
+    if (secret !== process.env.TELEGRAM_WEBHOOK_SECRET) return { ok: true };
+
+    const message = update.message || update.channel_post;
+    if (!message) return { ok: true };
+    const chat = await prisma.chat.findFirst({ where: { chatId: String(message.chat.id) }, include: { settings: true, bot: { include: { owner: { include: { subscriptions: true } } } } } });
+    if (!chat?.settings?.enabled) return { ok: true };
+
+    // проверка подписки владельца
+    const owner = chat.bot.owner;
+    const active = owner.subscriptions.some(s => s.status === 'active' && s.currentPeriodEnd > new Date());
+    if (!active) return { ok: true };
+
+    const text: string = message.text ?? '';
+
+    // простой вызов LLM (заглушка, лучше вынести в воркер)
+    const sys = `Твоя задача: ${chat.settings.prompt || 'Отвечай кратко и полезно.'}`;
+    const reply = await simpleOpenAI(sys, text, chat.settings.maxTokens ?? 256, chat.settings.temperature ?? 0.7);
+
+    await sendTelegramMessage(chat.bot.tokenEnc, message.chat.id, reply);
+    await prisma.usageLog.create({ data: { chatId: chat.id, tokens: reply.length } });
+    return { ok: true };
+  }
+}
+
+async function simpleOpenAI(system: string, user: string, max: number, temp: number) {
+  const r = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [ { role: 'system', content: system }, { role: 'user', content: user } ],
+      max_tokens: max,
+      temperature: temp
+    })
+  });
+  const j = await r.json();
+  return j.choices?.[0]?.message?.content ?? '…';
+}
+
+async function sendTelegramMessage(tokenEnc: string, chatId: number, text: string) {
+  const token = tokenEnc; // TODO: расшифровать токен, здесь без шифрования для MVP
+  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text })
+  });
+}
+```
+
+## apps/api/src/modules/billing.controller.ts (заглушка Stripe)
+```ts
+import { Controller, Post, Req } from '@nestjs/common';
+import { prisma } from '@danika/db/src/index.js';
+
+@Controller('billing')
+export class BillingController {
+  @Post('stripe/webhook')
+  async stripeWebhook(@Req() req: any) {
+    // TODO: Verify signature, parse event
+    // Для MVP: имитируем активную подписку на 30 дней
+    const userId = req.query.userId as string;
+    const plan = req.query.plan as string;
+    await prisma.subscription.create({
+      data: {
+        userId,
+        provider: 'stripe',
+        plan: plan || 'starter',
+        status: 'active',
+        currentPeriodEnd: new Date(Date.now() + 30 * 24 * 3600 * 1000)
+      }
+    });
+    return { received: true };
+  }
+}
+```
+
+---
+
+# apps/bot (Telegraf worker для регистрации чатов)
+
+## apps/bot/package.json
+```json
+{
+  "name": "@danika/bot",
+  "version": "0.1.0",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@danika/db": "*",
+    "dotenv": "^16.4.5",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0",
+    "typescript": "^5.5.4"
+  }
+}
+```
+
+## apps/bot/src/index.ts
+```ts
+import 'dotenv/config';
+import { Telegraf } from 'telegraf';
+import { prisma } from '@danika/db/src/index.js';
+
+const token = process.env.TELEGRAM_BOT_TOKEN!;
+const bot = new Telegraf(token);
+
+bot.start(async (ctx) => {
+  await ctx.reply('Привет! Добавь меня в группу/канал и выдай права. Я зарегистрирую чат.');
+});
+
+bot.on('my_chat_member', async (ctx) => {
+  const chat = ctx.myChatMember.chat;
+  const type = chat.type;
+  await prisma.bot.upsert({
+    where: { username: process.env.TELEGRAM_BOT_USERNAME! },
+    update: {},
+    create: {
+      owner: { connectOrCreate: { where: { tgId: BigInt(0) }, create: { tgId: BigInt(0) } } },
+      tokenEnc: token,
+      username: process.env.TELEGRAM_BOT_USERNAME!
+    }
+  });
+  const botRow = await prisma.bot.findUnique({ where: { username: process.env.TELEGRAM_BOT_USERNAME! } });
+  if (!botRow) return;
+  await prisma.chat.upsert({
+    where: { chatId: String(chat.id) },
+    update: { title: (chat as any).title ?? chat.username ?? undefined, type, botId: botRow.id },
+    create: { chatId: String(chat.id), title: (chat as any).title ?? chat.username ?? null, type, botId: botRow.id }
+  });
+});
+
+bot.launch();
+console.log('Bot worker started');
+```
+
+---
+
+# apps/web (Next.js кабинет)
+
+## apps/web/package.json
+```json
+{
+  "name": "@danika/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}
+```
+
+## apps/web/app/layout.tsx
+```tsx
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="ru">
+      <body className="min-h-screen bg-gray-50 text-gray-900">{children}</body>
+    </html>
+  );
+}
+```
+
+## apps/web/app/page.tsx (Login + ссылки)
+```tsx
+'use client';
+import { useEffect } from 'react';
+
+export default function Home() {
+  useEffect(() => {
+    // Загружаем Telegram Login Widget
+    const s = document.createElement('script');
+    s.src = 'https://telegram.org/js/telegram-widget.js?22';
+    s.async = true;
+    s.setAttribute('data-telegram-login', process.env.NEXT_PUBLIC_TG_BOT_USERNAME || '');
+    s.setAttribute('data-size', 'large');
+    s.setAttribute('data-userpic', 'false');
+    s.setAttribute('data-onauth', 'onTelegramAuth(user)');
+    (window as any).onTelegramAuth = async (user: any) => {
+      const r = await fetch(process.env.NEXT_PUBLIC_API_URL + '/auth/telegram', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(user) });
+      const j = await r.json();
+      localStorage.setItem('token', j.token);
+      window.location.href = '/dashboard';
+    };
+    document.body.appendChild(s);
+  }, []);
+
+  return (
+    <main className="max-w-xl mx-auto py-16">
+      <h1 className="text-3xl font-semibold mb-4">Данька — ИИ-бот для ваших чатов</h1>
+      <p className="mb-6">Войдите через Telegram, чтобы управлять промптами и подпиской.</p>
+      <div id="tg-login" />
+    </main>
+  );
+}
+```
+
+## apps/web/app/dashboard/page.tsx
+```tsx
+'use client';
+import { useEffect, useState } from 'react';
+
+type Chat = { id: string; chatId: string; title?: string; type: string; settings?: any };
+
+export default function Dashboard() {
+  const [chats, setChats] = useState<Chat[]>([]);
+
+  useEffect(() => {
+    (async () => {
+      const token = localStorage.getItem('token');
+      const userId = token?.split('.')[1];
+      const r = await fetch(process.env.NEXT_PUBLIC_API_URL + '/chats/' + userId);
+      setChats(await r.json());
+    })();
+  }, []);
+
+  const toggle = async (chatId: string, enabled: boolean) => {
+    await fetch(process.env.NEXT_PUBLIC_API_URL + `/chats/${chatId}/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+    location.reload();
+  };
+
+  return (
+    <main className="max-w-3xl mx-auto py-10">
+      <h2 className="text-2xl font-semibold mb-4">Мои чаты</h2>
+      <div className="space-y-3">
+        {chats.map((c) => (
+          <div key={c.id} className="bg-white border p-4 rounded-xl flex items-center justify-between">
+            <div>
+              <div className="font-medium">{c.title || c.chatId}</div>
+              <div className="text-sm text-gray-500">{c.type}</div>
+            </div>
+            <div className="flex items-center gap-3">
+              <a href={`/chat/${c.id}`} className="px-3 py-2 rounded-lg border">Изменить промпт</a>
+              <button onClick={() => toggle(c.id, !(c.settings?.enabled))} className="px-3 py-2 rounded-lg bg-black text-white">
+                {c.settings?.enabled ? 'Выключить' : 'Включить'}
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </main>
+  );
+}
+```
+
+## apps/web/app/chat/[id]/page.tsx
+```tsx
+'use client';
+import { useEffect, useState } from 'react';
+import { useParams } from 'next/navigation';
+
+export default function ChatSettingsPage() {
+  const params = useParams();
+  const id = params?.id as string;
+  const [prompt, setPrompt] = useState('');
+  const [enabled, setEnabled] = useState(false);
+
+  useEffect(() => {
+    // здесь для простоты опустим fetch текущих настроек
+  }, []);
+
+  const save = async () => {
+    await fetch(process.env.NEXT_PUBLIC_API_URL + `/chats/${id}/settings`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt, enabled }) });
+    alert('Сохранено');
+  };
+
+  return (
+    <main className="max-w-2xl mx-auto py-10">
+      <h2 className="text-2xl font-semibold mb-4">Настройки чата</h2>
+      <label className="block text-sm mb-2">Как отвечать (промпт)</label>
+      <textarea value={prompt} onChange={(e)=>setPrompt(e.target.value)} className="w-full h-40 border rounded-lg p-3" placeholder="Напр: отвечай стихами, используй мат (включить в настройках безопасности), ставь запятые после каждого слова" />
+      <div className="mt-3 flex items-center gap-2">
+        <input type="checkbox" checked={enabled} onChange={(e)=>setEnabled(e.target.checked)} />
+        <span>Включить бота для этого чата</span>
+      </div>
+      <button onClick={save} className="mt-4 px-4 py-2 rounded-lg bg-black text-white">Сохранить</button>
+    </main>
+  );
+}
+```
+
+---
+
+# README.md (короткая инструкция)
+
+```md
+## Быстрый старт
+1) Скопируй `.env.example` в `.env` и заполни токены.
+2) Подними Postgres (например, Docker) и выполни `pnpm i && pnpm db:push`.
+3) Запусти всё: `pnpm dev` (web:3000, api:4000, bot-воркер).
+4) В BotFather создай бота, включи вебхук на `POST /telegram/webhook` API, поставь секрет `TELEGRAM_WEBHOOK_SECRET`.
+5) В вебе войди через Telegram Login Widget, добавь бота в группу/канал, настрой промпт.
+6) Оформи подписку (для MVP — заглушка `/billing/stripe/webhook?userId=...&plan=starter`).
+```
+
+---
+
+# Заметки по доработке
+- Зашифровать токен бота (KMS/Vault), вынести LLM в очередь (BullMQ) и добавить модерацию.
+- Реализовать реальную проверку Stripe webhook.
+- Подгружать текущие `ChatSettings` на страницу `/chat/[id]`.
+- Включить privacy-mode OFF или обрабатывать упоминания, чтобы бот видел сообщения в группах.
+```

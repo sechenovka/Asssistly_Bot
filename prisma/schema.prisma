@@ -1,0 +1,52 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         Int       @id @default(autoincrement())
+  telegramId String    @unique
+  username   String?
+  firstName  String?
+  lastName   String?
+  lang       String?
+  isBot      Boolean?
+  messages   Message[]
+}
+
+model Chat {
+  id         Int       @id @default(autoincrement())
+  telegramId String    @unique
+  type       String?
+  title      String?
+  username   String?
+  firstName  String?
+  lastName   String?
+  messages   Message[]
+}
+
+model Message {
+  id         Int      @id @default(autoincrement())
+  messageId  String
+  text       String?
+  date       DateTime
+  raw        Json?
+  fromUserId Int?
+  chatId     Int?
+  updateId   Int?
+  update     Update?  @relation(fields: [updateId], references: [id])
+  chat       Chat?    @relation(fields: [chatId], references: [id])
+  fromUser   User?    @relation(fields: [fromUserId], references: [id])
+}
+
+model Update {
+  id        Int       @id @default(autoincrement())
+  updateId  String?
+  payload   Json
+  createdAt DateTime  @default(now())
+  messages  Message[]
+}

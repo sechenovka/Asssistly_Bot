@@ -1,0 +1,14 @@
+{
+  "1441173568": {
+    "enabled": true,
+    "prompt": "отвечай в вежливой форме",
+    "mentionsOnly": false,
+    "onlyFromUserId": null
+  },
+  "<ТВОЙ_CHAT_ID>": {
+    "enabled": true,
+    "prompt": "Отвечай как эксперт по саморазвитию.",
+    "mentionsOnly": false,
+    "onlyFromUserId": null
+  }
+}
