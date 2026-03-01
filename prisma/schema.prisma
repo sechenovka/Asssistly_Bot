@@ -8,45 +8,210 @@ datasource db {
 }
 
 model User {
-  id         Int       @id @default(autoincrement())
-  telegramId String    @unique
-  username   String?
-  firstName  String?
-  lastName   String?
-  lang       String?
-  isBot      Boolean?
-  messages   Message[]
+  id              Int           @id @default(autoincrement())
+  telegramId      String        @unique
+  username        String?
+  createdAt       DateTime      @default(now())
+  subscriptionTil DateTime?
+  prompt          UserPrompt?
+  chats           Chat[]
+  logs            MessageLog[]  @relation("UserLogs")
+  payments        Payment[]
+  dmAutoConfig   DmAutoConfig?
+  dmChats        DmChat[]
+  dmReplyJobs    DmReplyJob[]
+  isBanned     Boolean   @default(false)
+  style        String?
+  memory       Json?
+  
+  onboardingCompleted Boolean @default(false)
+
+  lastReplyAt DateTime?
+} 
+
+model UserPrompt {
+  id        Int      @id @default(autoincrement())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    Int      @unique
+  text      String
+  updatedAt DateTime @default(now())
 }
 
 model Chat {
-  id         Int       @id @default(autoincrement())
-  telegramId String    @unique
-  type       String?
-  title      String?
-  username   String?
-  firstName  String?
-  lastName   String?
-  messages   Message[]
+  id          Int      @id @default(autoincrement())
+  telegramId  String
+  title       String?
+  user        User     @relation(fields: [userId], references: [id])
+  userId      Int
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
 }
 
-model Message {
-  id         Int      @id @default(autoincrement())
-  messageId  String
-  text       String?
-  date       DateTime
-  raw        Json?
-  fromUserId Int?
-  chatId     Int?
-  updateId   Int?
-  update     Update?  @relation(fields: [updateId], references: [id])
-  chat       Chat?    @relation(fields: [chatId], references: [id])
-  fromUser   User?    @relation(fields: [fromUserId], references: [id])
+model MessageLog {
+  id             Int      @id @default(autoincrement())
+  user           User     @relation("UserLogs", fields: [userId], references: [id])
+  userId         Int
+  chatTelegramId String
+  incomingText   String
+  replyText      String?
+  createdAt      DateTime @default(now())
 }
 
-model Update {
-  id        Int       @id @default(autoincrement())
-  updateId  String?
-  payload   Json
-  createdAt DateTime  @default(now())
-  messages  Message[]
+model Payment {
+  id        Int      @id @default(autoincrement())
+
+  user      User     @relation(fields: [userId], references: [id])
+  userId    Int
+
+  amount    Int
+  currency  String   @default("RUB")
+  duration  Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  expiresAt DateTime?
+
+  // YooKassa payment id
+  providerId String  @unique
+
+  // UX поля (чтобы потом editMessageText)
+  chatId     String?
+  messageId  Int?
+
+  // статус
+  status     String  @default("pending") // pending | succeeded | canceled
+  plan       String               // trial | 7 | 30 | 180 | 365
+}
+
+model DailyStats {
+  id        Int      @id @default(autoincrement())
+  date      DateTime @unique
+  messages  Int      @default(0)
+  aiReplies Int      @default(0)
+  newUsers  Int      @default(0)
+  createdAt DateTime @default(now())
+}
+
+model ChatSettings {
+  id             Int      @id @default(autoincrement())
+  telegramChatId String   @unique
+  userTelegramId String
+  enabled        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+}
+
+model ChatLink {
+  id            Int      @id @default(autoincrement())
+  telegramChatId String
+  title         String?
+  type          String?   // private/group/supergroup
+  userTelegramId String    // владелец (кто “подключил”)
+  enabled       Boolean    @default(false)
+  createdAt     DateTime   @default(now())
+
+  @@unique([telegramChatId, userTelegramId])
+}
+
+// ==========================
+// DM Auto-Reply (личные чаты)
+// ==========================
+
+enum DmReplyStatus {
+  pending
+  sent
+  cancelled
+  failed
+}
+
+model DmAutoConfig {
+  /// Владелец автоответчика (ссылка на User.telegramId)
+  userTelegramId String  @id
+  user           User    @relation(fields: [userTelegramId], references: [telegramId], onDelete: Cascade)
+
+  /// Включен ли автоответчик в ЛС
+  enabled         Boolean @default(false)
+
+  /// Задержка ответа (сек)
+  delayMinSec     Int     @default(15)
+  delayMaxSec     Int     @default(30)
+
+  /// Максимум активных диалогов (5 — бесплатно; больше — по подписке)
+  maxDialogs      Int     @default(5)
+
+  /// Через сколько часов диалог перестаёт считаться активным
+  activeWindowHours Int   @default(12)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model DmChat {
+  id             Int     @id @default(autoincrement())
+
+  /// Владелец (ссылка на User.telegramId)
+  userTelegramId String
+  user           User    @relation(fields: [userTelegramId], references: [telegramId], onDelete: Cascade)
+
+  /// chat.id личного диалога (1-to-1)
+  peerChatId     String
+
+  title          String?
+  enabled        Boolean @default(false)
+
+  lastSeenAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userTelegramId, peerChatId])
+  @@index([userTelegramId])
+}
+
+model DmReplyJob {
+  id               Int     @id @default(autoincrement())
+
+  /// Владелец (ссылка на User.telegramId)
+  userTelegramId   String
+  user             User    @relation(fields: [userTelegramId], references: [telegramId], onDelete: Cascade)
+
+  /// peer chat
+  peerChatId       String
+
+  /// message_id входящего сообщения, чтобы не отвечать дважды
+  incomingMessageId String
+  incomingText      String
+
+  /// Когда нужно отправить ответ
+  runAt            DateTime
+
+  status           DmReplyStatus @default(pending)
+  cancelReason     String?
+
+  /// Чтобы сохранить/переиспользовать сгенерированный ответ (не обязательно)
+  aiReply          String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, runAt])
+  @@index([userTelegramId, peerChatId])
+  @@unique([userTelegramId, peerChatId, incomingMessageId])
+}
+
+model DmAutoSettings {
+  id             Int      @id @default(autoincrement())
+  userTelegramId String   @unique
+
+  enabled        Boolean  @default(false)
+  delaySec       Int      @default(15)
+
+  // daily quota tracking (resets when usedDate != today)
+  usedToday      Int      @default(0)
+  usedDate       DateTime @default(now())
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([userTelegramId])
 }
