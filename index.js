@@ -30,7 +30,23 @@ const YOOKASSA_SHOP_ID = String(process.env.YOOKASSA_SHOP_ID || "").trim();
 const YOOKASSA_SECRET_KEY = String(process.env.YOOKASSA_SECRET_KEY || "").trim();
 const YOOKASSA_API = "https://api.yookassa.ru/v3";
 const TRIAL_DAYS = 3;
-const prisma = new PrismaClient();
+const ADMIN_FALLBACK_ID = "1441173568";
+const ADMIN_IDS = String(process.env.ADMIN_IDS || process.env.ADMIN_ID || "")
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+if (!ADMIN_IDS.length) {
+  ADMIN_IDS.push(ADMIN_FALLBACK_ID);
+  console.warn(
+    `[admin] ADMIN_ID(S) не задан в .env, включен fallback admin id: ${ADMIN_FALLBACK_ID}`
+  );
+}
+let prisma = null;
+try {
+  prisma = new PrismaClient();
+} catch (e) {
+  console.warn("[prisma] disabled at startup:", e?.message || e);
+}
 const STATE_FILE = path.resolve(process.cwd(), "data", "bot-state.json");
 
 const app = express();
@@ -63,13 +79,105 @@ const MODES = {
   },
 };
 
+/** @typedef {"business"|"polite"|"friendly"|"casual"|"short"|"formal"|"neutral"} ParaphraseStyle */
+const PARAPHRASE_STYLE = Object.freeze({
+  BUSINESS: "business",
+  POLITE: "polite",
+  FRIENDLY: "friendly",
+  CASUAL: "casual",
+  SHORT: "short",
+  FORMAL: "formal",
+  NEUTRAL: "neutral",
+});
+
+const STYLE_MODES = {
+  [PARAPHRASE_STYLE.BUSINESS]: {
+    label: "💼 Деловой",
+    instruction:
+      [
+        "Стиль: business (деловой).",
+        "Тон: профессиональный, уверенный, конструктивный.",
+        "Лексика: без сленга, без эмоциональных междометий, без фамильярности.",
+        "Синтаксис: четкие формулировки, логичная структура, акцент на действии/результате.",
+        "Обязательно заметно перефразируй текст (не дословно).",
+      ].join(" "),
+  },
+  [PARAPHRASE_STYLE.POLITE]: {
+    label: "🤝 Вежливый",
+    instruction:
+      [
+        "Стиль: polite (вежливый).",
+        "Тон: уважительный, мягкий, аккуратный.",
+        "Лексика: корректные формулировки, допустимы слова 'пожалуйста', 'буду признателен(на)'.",
+        "Синтаксис: плавные и тактичные обороты, без давления.",
+        "Обязательно заметно перефразируй текст (не дословно).",
+      ].join(" "),
+  },
+  [PARAPHRASE_STYLE.FRIENDLY]: {
+    label: "🙂 Дружелюбный",
+    instruction:
+      [
+        "Стиль: friendly (дружелюбный).",
+        "Тон: теплый, живой, естественный, как в комфортном личном общении.",
+        "Лексика: простая, человечная, без канцелярита.",
+        "Синтаксис: легко читаемые фразы, допустим разговорный ритм.",
+        "Обязательно заметно перефразируй текст (не дословно).",
+      ].join(" "),
+  },
+  [PARAPHRASE_STYLE.CASUAL]: {
+    label: "🧢 Неформальный",
+    instruction:
+      [
+        "Стиль: casual (неформальный).",
+        "Тон: разговорный, простой, без официоза.",
+        "Лексика: бытовая и короткая, но без грубости.",
+        "Синтаксис: компактные естественные фразы, можно чуть проще по конструкции.",
+        "Обязательно заметно перефразируй текст (не дословно).",
+      ].join(" "),
+  },
+  [PARAPHRASE_STYLE.SHORT]: {
+    label: "⚡ Кратко",
+    instruction:
+      [
+        "Стиль: short (кратко).",
+        "Тон: нейтрально-деловой, по сути.",
+        "Длина: 1-2 коротких предложения.",
+        "Смысл: сжать формулировку, но не терять факты (имена, даты, время, числа, ссылки, условия).",
+        "Обязательно заметно перефразируй текст (не дословно).",
+      ].join(" "),
+  },
+  [PARAPHRASE_STYLE.FORMAL]: {
+    label: "🏛 Официальный",
+    instruction:
+      [
+        "Стиль: formal (официальный).",
+        "Тон: строго официальный, нейтральный, выдержанный.",
+        "Лексика: деловая/официальная, без разговорных слов.",
+        "Синтаксис: аккуратные завершенные формулировки, возможно более книжные конструкции.",
+        "Обязательно заметно перефразируй текст (не дословно).",
+      ].join(" "),
+  },
+  [PARAPHRASE_STYLE.NEUTRAL]: {
+    label: "⚖️ Нейтральный",
+    instruction:
+      [
+        "Стиль: neutral (нейтральный).",
+        "Тон: спокойный, ровный, без оценочных эмоций.",
+        "Лексика: понятная и универсальная.",
+        "Синтаксис: чистые, естественные формулировки без канцелярита.",
+        "Обязательно заметно перефразируй текст (не дословно).",
+      ].join(" "),
+  },
+};
+
 const sessions = new Map();
 const replyKeyboardRemovedUsers = new Set();
 const pendingPayments = new Map();
 const usernameToId = new Map();
 const processedGroupSignals = new Set();
 let botUsernameCache = (process.env.TELEGRAM_BOT_USERNAME || "").trim();
-let prismaTelegramSchemaReady = true;
+let prismaTelegramSchemaReady = Boolean(prisma);
+let prismaFallbackLogged = false;
 
 async function readStateFile() {
   try {
@@ -277,10 +385,14 @@ function getSession(userId) {
   if (!sessions.has(key)) {
     sessions.set(key, {
       mode: "normal",
+      transformMode: PARAPHRASE_STYLE.NEUTRAL,
       delaySec: 10,
       awaitingInput: false,
+      awaitingTransformInput: false,
       lastIncomingText: "",
       lastDraft: "",
+      lastTransformInput: "",
+      lastTransformText: "",
       subscriptionUntil: null,
       trialUsed: false,
       pendingTimer: null,
@@ -295,6 +407,10 @@ function setSession(userId, patch) {
   Object.assign(s, patch);
   sessions.set(String(userId), s);
   return s;
+}
+
+function isAdmin(userId) {
+  return ADMIN_IDS.includes(String(userId));
 }
 
 function cacheUsername(from) {
@@ -357,6 +473,16 @@ async function ensureUserAndHydrateSession(userId, username = null) {
       const msg = String(e?.message || "");
       if (msg.includes("Unknown argument `telegramId`") || msg.includes("Invalid `prisma.user.upsert()` invocation")) {
         prismaTelegramSchemaReady = false;
+        if (!prismaFallbackLogged) {
+          prismaFallbackLogged = true;
+          console.warn("[prisma] telegramId schema mismatch, switched to file-state fallback");
+        }
+        const user = await fallbackUpsertUser(userId, uname);
+        setSession(userId, {
+          subscriptionUntil: user?.subscriptionTil ? new Date(user.subscriptionTil).toISOString() : null,
+          trialUsed: Boolean(user?.trialUsed),
+        });
+        return user;
       }
       console.error("prisma upsert fallback:", msg);
     }
@@ -592,6 +718,7 @@ function homeKeyboard(userId, username) {
   const showTrialButton = !isPremium(s) && !s.trialUsed;
   const rows = [
     [{ text: "✍️ Подготовить ответ", callback_data: "quick_reply_start" }],
+    [{ text: "🪄 Перефразировать текст", callback_data: "style_text_start" }],
     [{ text: "💳 Подписка", callback_data: "menu_sub" }],
     [{ text: "⚙️ Настройки", callback_data: "menu_settings" }],
     ...(showTrialButton ? [[{ text: "🎁 Пробная 0 ₽", callback_data: "buy_trial" }]] : []),
@@ -680,11 +807,14 @@ function buildHomeText(userId) {
   const showUpsell = !isPremium(s) && !s.trialUsed;
   return (
     "🤖 <b>Готовые ответы для твоих чатов - за 10 секунд</b>\n\n" +
-    "Ты вставляешь сообщение - я предлагаю вариант ответа. Ты копируешь и отправляешь его сам.\n\n" +
+    "Две функции:\n" +
+    "• <b>Подготовить ответ</b> — когда тебе задали вопрос, а ты хочешь быстро отправить готовый ответ.\n" +
+    "• <b>Перефразировать текст</b> — когда нужно переписать любое сообщение под нужный стиль.\n\n" +
     "<b>Что сделать сейчас:</b>\n" +
     "1) Нажми ✍️ <b>Подготовить ответ</b>\n" +
-    "2) Выбери режим и отправь текст\n" +
-    "3) Скопируй готовый ответ и отправь собеседнику\n\n" +
+    "2) Или выбери 🪄 <b>Перефразировать текст</b>\n" +
+    "3) Выбери режим и отправь текст\n" +
+    "4) Скопируй готовый вариант\n\n" +
     "Пример:\n" +
     "«Можно созвониться завтра?» ->\n" +
     "«Да, давай после 16:00. Напиши, какое время тебе удобно»\n\n" +
@@ -703,6 +833,78 @@ function buildQuickStartText() {
     "Пример:\n" +
     "«Можно созвониться завтра?» -> «Да, давай после 16:00. Какое время тебе удобно?»\n\n" +
     "👇 Просто отправь сюда сообщение - и я предложу готовый ответ."
+  );
+}
+
+function styleToolKeyboard(userId) {
+  const s = getSession(userId);
+  const premium = isPremium(s);
+
+  const modeButton = (key, label) => {
+    const mark = s.transformMode === key ? "✅ " : "";
+    const locked = !premium && ![PARAPHRASE_STYLE.NEUTRAL, PARAPHRASE_STYLE.POLITE].includes(key);
+    return {
+      text: locked ? `🔒 ${label}` : `${mark}${label}`,
+      callback_data: locked ? "menu_sub" : `style_mode_${key}`,
+    };
+  };
+
+  return {
+    inline_keyboard: [
+      [
+        modeButton(PARAPHRASE_STYLE.BUSINESS, "💼 Деловой"),
+        modeButton(PARAPHRASE_STYLE.POLITE, "🤝 Вежливый"),
+      ],
+      [
+        modeButton(PARAPHRASE_STYLE.FRIENDLY, "🙂 Дружелюбный"),
+        modeButton(PARAPHRASE_STYLE.CASUAL, "🧢 Неформальный"),
+      ],
+      [
+        modeButton(PARAPHRASE_STYLE.SHORT, "⚡ Кратко"),
+        modeButton(PARAPHRASE_STYLE.FORMAL, "🏛 Официальный"),
+      ],
+      [modeButton(PARAPHRASE_STYLE.NEUTRAL, "⚖️ Нейтральный")],
+      [{ text: "✍️ Ввести текст", callback_data: "style_input" }],
+      ...(s.lastTransformInput
+        ? [[{ text: "🔁 Обработать последнее", callback_data: "style_use_last" }]]
+        : []),
+      [{ text: "⬅ Назад", callback_data: "menu_home" }],
+    ],
+  };
+}
+
+function styleResultKeyboard(userId) {
+  const s = getSession(userId);
+  return {
+    inline_keyboard: [
+      [{ text: "📋 Скопировать", callback_data: "style_copy" }],
+      [{ text: "🔄 Еще вариант", callback_data: "style_regen" }],
+      [{ text: "🎨 Другой стиль", callback_data: "style_text_start" }],
+      ...(!isPremium(s) && !s.trialUsed
+        ? [
+            [{ text: "🎁 Пробная 0 ₽", callback_data: "buy_trial" }],
+            [{ text: "✨ Что дает подписка", callback_data: "sub_benefits" }],
+          ]
+        : []),
+      [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
+    ],
+  };
+}
+
+function buildStyleStartText() {
+  return (
+    "🪄 <b>Перефразировать текст</b>\n\n" +
+    "Это отдельная функция ИИ-редактора.\n" +
+    "Она <b>не отвечает</b> на твой текст, а только переписывает его в выбранном стиле.\n\n" +
+    "Стили для перефраза:\n" +
+    "• 💼 Деловой\n" +
+    "• 🤝 Вежливый\n" +
+    "• 🙂 Дружелюбный\n" +
+    "• 🧢 Неформальный\n" +
+    "• ⚡ Кратко\n" +
+    "• 🏛 Официальный\n" +
+    "• ⚖️ Нейтральный\n\n" +
+    "👇 Выбери стиль и нажми «Ввести текст»."
   );
 }
 
@@ -837,6 +1039,216 @@ async function createDraft(incomingText, mode) {
   return text;
 }
 
+function sanitizeParaphraseOutput(text = "") {
+  let out = String(text || "").trim();
+  out = out.replace(/^["'«»]+|["'«»]+$/g, "").trim();
+
+  // Убираем служебные фразы модели, оставляем только сам переписанный текст.
+  const prefixes = [
+    /^вот\s+(?:перефразированный|переписанный)\s+(?:вариант|текст)\s*:\s*/i,
+    /^перефразированный\s+текст\s*:\s*/i,
+    /^переписанный\s+текст\s*:\s*/i,
+    /^вариант\s*:\s*/i,
+    /^ответ\s*:\s*/i,
+  ];
+  for (const rx of prefixes) out = out.replace(rx, "");
+
+  return out.trim();
+}
+
+/**
+ * paraphraseStatement(...)
+ * Перефразирует исходное утверждение под выбранный стиль.
+ * Ничего не объясняет и не отвечает по сути сообщения.
+ *
+ * @param {string} incomingText
+ * @param {ParaphraseStyle|string} style
+ * @returns {Promise<string>}
+ */
+async function paraphraseStatement(incomingText, style) {
+  const src = String(incomingText || "").trim();
+  if (!src) return "";
+
+  /** @type {ParaphraseStyle} */
+  const safeStyle = STYLE_MODES[String(style || "").toLowerCase()]
+    ? String(style || "").toLowerCase()
+    : PARAPHRASE_STYLE.NEUTRAL;
+  const styleInstruction = STYLE_MODES[safeStyle].instruction;
+
+  const fallbackParaphrase = () => {
+    const normalizeSpaces = (s) =>
+      String(s || "")
+        .replace(/\s+/g, " ")
+        .replace(/\s*([,!.?;:])/g, "$1")
+        .trim();
+    const lowerFirst = (s) => (s ? s.charAt(0).toLowerCase() + s.slice(1) : s);
+
+    const toSentences = (s) => {
+      const t = normalizeSpaces(s);
+      if (!t) return [];
+      const arr = t.split(/(?<=[.!?])\s+/).filter(Boolean);
+      return arr.length ? arr : [t];
+    };
+
+    const applyReplacements = (text, pairs) => {
+      let out = ` ${text} `;
+      for (const [rx, val] of pairs) out = out.replace(rx, val);
+      return normalizeSpaces(out);
+    };
+
+    const basePairs = [
+      [/\bа вообще вот\b/gi, ""],
+      [/\bа вообще\b/gi, ""],
+      [/\bвообще вот\b/gi, ""],
+      [/\bпотому что\b/gi, "так как"],
+      [/\bсозвон\b/gi, "звонок"],
+      [/\bдавай\b/gi, "предлагаю"],
+      [/\bнапиши\b/gi, "сообщи"],
+      [/\bкто-?нибудь\b/gi, "кто-то"],
+      [/\bпо нему\b/gi, "по этому проекту"],
+    ];
+    const businessPairs = [
+      [/\bпривет\b/gi, "Здравствуйте"],
+      [/\bсообщи\b/gi, "сообщите"],
+      [/\bудобнее\b/gi, "удобно"],
+      [/\bкто-то работает\b/gi, "ведется работа"],
+    ];
+    const politePairs = [
+      [/\bпривет\b/gi, "Здравствуйте"],
+      [/\bнапиши\b/gi, "подскажите, пожалуйста"],
+      [/\bсообщи\b/gi, "сообщите, пожалуйста"],
+    ];
+    const friendlyPairs = [
+      [/\bздравствуйте\b/gi, "Привет"],
+      [/\bсообщите\b/gi, "напиши"],
+    ];
+    const casualPairs = [
+      [/\bпредлагаю\b/gi, "давай"],
+      [/\bне получится\b/gi, "не выйдет"],
+      [/\bсообщите\b/gi, "напиши"],
+    ];
+    const formalPairs = [
+      [/\bпривет\b/gi, "Здравствуйте"],
+      [/\bдавай\b/gi, "предлагаю"],
+      [/\bнапиши\b/gi, "прошу сообщить"],
+      [/\bсообщи\b/gi, "прошу сообщить"],
+      [/\bтебе\b/gi, "вам"],
+    ];
+    const neutralPairs = [
+      [/\bдавай\b/gi, "предлагаю"],
+      [/\bнапиши\b/gi, "сообщи"],
+    ];
+
+    const sentences = toSentences(src);
+    let out = applyReplacements(src, basePairs);
+
+    if (safeStyle === PARAPHRASE_STYLE.BUSINESS) {
+      out = applyReplacements(out, businessPairs);
+      if (/\?$/.test(out)) {
+        const core = out.replace(/\?+$/, "").trim();
+        out = `Подскажите, ${lowerFirst(core)}?`;
+      }
+    } else if (safeStyle === PARAPHRASE_STYLE.POLITE) {
+      out = applyReplacements(out, politePairs);
+      if (/\?$/.test(out)) {
+        const core = out.replace(/\?+$/, "").trim();
+        out = `Подскажите, пожалуйста, ${lowerFirst(core)}?`;
+      }
+    } else if (safeStyle === PARAPHRASE_STYLE.FRIENDLY) {
+      out = applyReplacements(out, friendlyPairs);
+      if (/\?$/.test(out) && !/^слушай/i.test(out)) out = `Слушай, ${lowerFirst(out)}`;
+    } else if (safeStyle === PARAPHRASE_STYLE.CASUAL) {
+      out = applyReplacements(out, casualPairs);
+      if (/\?$/.test(out) && !/^слушай/i.test(out)) out = `Слушай, ${lowerFirst(out)}`;
+    } else if (safeStyle === PARAPHRASE_STYLE.FORMAL) {
+      out = applyReplacements(out, formalPairs);
+      if (/\?$/.test(out)) {
+        const core = out.replace(/\?+$/, "").trim();
+        out = `Прошу уточнить, ${lowerFirst(core)}.`;
+      }
+    } else if (safeStyle === PARAPHRASE_STYLE.NEUTRAL) {
+      out = applyReplacements(out, neutralPairs);
+    } else if (safeStyle === PARAPHRASE_STYLE.SHORT) {
+      // Кратко, но без потери ключевых фактов: берем до 2 предложений и ужимаем лексику.
+      const firstTwo = sentences.slice(0, 2).join(" ");
+      out = applyReplacements(firstTwo, basePairs);
+      out = out.replace(/\b(пожалуйста|прошу)\b/gi, "").replace(/\s+/g, " ").trim();
+      if (out.length > 170) out = `${out.slice(0, 167).trim()}...`;
+    }
+
+    // Если вдруг почти не изменилось — делаем минимальную гарантированную перестройку.
+    if (normalizeSpaces(out).toLowerCase() === normalizeSpaces(src).toLowerCase()) {
+      out = applyReplacements(src, [
+        [/\bа вообще вот\b/gi, ""],
+        [/\bпотому что\b/gi, "так как"],
+        [/\bдавай\b/gi, "предлагаю"],
+        [/\bнапиши\b/gi, "сообщи"],
+        [/\bкто-?нибудь\b/gi, "кто-то"],
+      ]);
+    }
+
+    return out;
+  };
+
+  if (!openai) return fallbackParaphrase();
+
+  try {
+    const rewriteRules = [
+      "Ты редактор уровня senior copywriter.",
+      "Задача: ПЕРЕФРАЗИРОВАТЬ исходный текст под заданный стиль.",
+      "Запрещено: отвечать на текст, советовать, спорить, анализировать, добавлять новые факты, удалять важные факты.",
+      "Обязательно: сохранить все факты, числа, даты, имена, ссылки, смысл и язык исходника.",
+      "Обязательно: выдать заметно перефразированный вариант, не копию оригинала.",
+      "Верни только итоговый текст без кавычек, без префиксов и без пояснений.",
+    ].join(" ");
+
+    const completion = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      temperature: 0.8,
+      max_tokens: 320,
+      messages: [
+        {
+          role: "system",
+          content: rewriteRules,
+        },
+        { role: "system", content: styleInstruction },
+        {
+          role: "user",
+          content: [
+            `Стиль: ${safeStyle}`,
+            "Сделай переписывание в стиле выше.",
+            "Не давай ответ по смыслу сообщения. Только переформулируй исходник.",
+            "",
+            "Исходный текст:",
+            src,
+          ].join("\n"),
+        },
+      ],
+    });
+
+    const raw = completion.choices?.[0]?.message?.content?.trim() || "";
+    const clean = sanitizeParaphraseOutput(raw);
+    if (!clean) return fallbackParaphrase();
+
+    // Не допускаем 1-в-1 копию исходника: форсим стиль через fallback.
+    const norm = (s) =>
+      String(s || "")
+        .toLowerCase()
+        .replace(/\s+/g, " ")
+        .trim();
+    if (norm(clean) === norm(src)) return fallbackParaphrase();
+    return clean;
+  } catch (e) {
+    console.error("paraphraseStatement fallback:", e?.message || e);
+    return fallbackParaphrase();
+  }
+}
+
+// Backward compatibility with existing call sites.
+async function createStyledText(incomingText, mode) {
+  return paraphraseStatement(incomingText, mode);
+}
+
 async function sendDraftWithDelay({ chatId, userId, incomingText }) {
   const s = getSession(userId);
   cancelPending(userId);
@@ -881,6 +1293,38 @@ async function sendDraftWithDelay({ chatId, userId, incomingText }) {
   }, Math.max(1, Number(s.delaySec || 10)) * 1000);
 
   setSession(userId, { pendingTimer: timer });
+}
+
+async function processStyledText({ chatId, userId, incomingText }) {
+  const s = getSession(userId);
+  await sendMessage(chatId, "🪄 Перефразирую текст под выбранный стиль...", { parse_mode: "HTML" });
+
+  try {
+    const result = await createStyledText(incomingText, s.transformMode);
+    setSession(userId, {
+      lastTransformInput: incomingText,
+      lastTransformText: result,
+      awaitingTransformInput: false,
+      awaitingInput: false,
+    });
+
+    await sendMessage(
+      chatId,
+        "📝 <b>Перефразированный текст:</b>\n\n" +
+        `${escapeHtml(result)}\n\n` +
+        `<i>Стиль: ${escapeHtml(STYLE_MODES[s.transformMode]?.label || STYLE_MODES.business.label)}</i>\n\n` +
+        "<i>(Скопируй и используй)</i>",
+      {
+        parse_mode: "HTML",
+        reply_markup: styleResultKeyboard(userId),
+      }
+    );
+  } catch (err) {
+    console.error("style generation error:", err?.message || err);
+    await sendMessage(chatId, "Не получилось перефразировать текст. Попробуй еще раз.", {
+      reply_markup: { inline_keyboard: [[{ text: "🪄 Перефразировать текст", callback_data: "style_text_start" }]] },
+    });
+  }
 }
 
 async function notifyGroupQuestionToUser({ targetUserId, sourceMsg, incomingText }) {
@@ -933,10 +1377,18 @@ async function renderHome(chatId, userId, messageId = null) {
 }
 
 async function renderQuickStart(chatId, userId, messageId) {
-  setSession(userId, { awaitingInput: true });
+  setSession(userId, { awaitingInput: true, awaitingTransformInput: false });
   return editMessageText(chatId, messageId, buildQuickStartText(), {
     parse_mode: "HTML",
     reply_markup: quickReplyKeyboard(userId),
+  });
+}
+
+async function renderStyleTool(chatId, userId, messageId) {
+  setSession(userId, { awaitingInput: false, awaitingTransformInput: true });
+  return editMessageText(chatId, messageId, buildStyleStartText(), {
+    parse_mode: "HTML",
+    reply_markup: styleToolKeyboard(userId),
   });
 }
 
@@ -1093,6 +1545,47 @@ async function handleCommand(message, text) {
       `⏱ <b>Задержка:</b> ${s.delaySec} сек`;
     return sendMessage(chatId, statusText, { parse_mode: "HTML" });
   }
+  if (cmd === "/admin") {
+    if (!isAdmin(userId)) {
+      return sendMessage(
+        chatId,
+        `⛔ Нет доступа.\nТвой Telegram ID: <code>${escapeHtml(String(userId))}</code>`,
+        { parse_mode: "HTML" }
+      );
+    }
+
+    const state = await readStateFile();
+    const users = Object.values(state?.users || {});
+    const now = Date.now();
+
+    const total = users.length;
+    const withSub = users.filter((u) => {
+      const dt = new Date(u?.subscriptionTil || 0).getTime();
+      return Number.isFinite(dt) && dt > now;
+    }).length;
+    const withTrial = users.filter((u) => Boolean(u?.trialUsed)).length;
+
+    const rows = users
+      .slice(0, 25)
+      .map((u) => {
+        const uname = u?.username ? `@${u.username}` : "без username";
+        const subOk = (() => {
+          const dt = new Date(u?.subscriptionTil || 0).getTime();
+          return Number.isFinite(dt) && dt > now;
+        })();
+        return `• ${u.telegramId} (${uname}) ${subOk ? "✅ sub" : "🆓"}`;
+      })
+      .join("\n");
+
+    const textOut =
+      "🛠 <b>Админ-панель</b>\n\n" +
+      `👥 Пользователей: <b>${total}</b>\n` +
+      `💳 Активных подписок: <b>${withSub}</b>\n` +
+      `🎁 Использовали trial: <b>${withTrial}</b>\n\n` +
+      (rows ? "<b>Последние пользователи:</b>\n" + rows : "Пока нет пользователей.");
+
+    return sendMessage(chatId, textOut, { parse_mode: "HTML" });
+  }
 }
 
 async function handleCallback(query) {
@@ -1144,8 +1637,9 @@ async function handleCallback(query) {
 
   if (data === "menu_home") return renderHome(chatId, userId, messageId);
   if (data === "quick_reply_start") return renderQuickStart(chatId, userId, messageId);
+  if (data === "style_text_start") return renderStyleTool(chatId, userId, messageId);
   if (data === "quick_input") {
-    setSession(userId, { awaitingInput: true });
+    setSession(userId, { awaitingInput: true, awaitingTransformInput: false });
     return sendMessage(
       chatId,
       "✍️ <b>Ввести текст</b>\n\nПришли одно сообщение, на которое нужно подготовить ответ.",
@@ -1154,6 +1648,23 @@ async function handleCallback(query) {
         reply_markup: {
           inline_keyboard: [
             [{ text: "⬅ Назад", callback_data: "quick_reply_start" }],
+            [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
+          ],
+        },
+      }
+    );
+  }
+
+  if (data === "style_input") {
+    setSession(userId, { awaitingTransformInput: true, awaitingInput: false });
+    return sendMessage(
+      chatId,
+      "🎨 <b>Ввести текст</b>\n\nПришли текст, который нужно обработать под выбранный стиль.",
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "⬅ Назад", callback_data: "style_text_start" }],
             [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
           ],
         },
@@ -1182,12 +1693,41 @@ async function handleCallback(query) {
     });
   }
 
+  if (data === "style_copy") {
+    const s = getSession(userId);
+    if (!s.lastTransformText) {
+      return answerCallbackQuery(query.id, { text: "Текста еще нет", show_alert: true });
+    }
+    return sendMessage(chatId, "📋 <b>Текст для копирования:</b>\n\n" + escapeHtml(s.lastTransformText), {
+      parse_mode: "HTML",
+      reply_markup: styleResultKeyboard(userId),
+    });
+  }
+
   if (data === "quick_reply_regen") {
     const s = getSession(userId);
     if (!s.lastIncomingText) {
       return answerCallbackQuery(query.id, { text: "Сначала пришли текст", show_alert: true });
     }
     return sendDraftWithDelay({ chatId, userId, incomingText: s.lastIncomingText });
+  }
+
+  if (data === "style_regen") {
+    const s = getSession(userId);
+    if (!s.lastTransformInput) {
+      return answerCallbackQuery(query.id, { text: "Сначала пришли текст", show_alert: true });
+    }
+    return processStyledText({ chatId, userId, incomingText: s.lastTransformInput });
+  }
+
+  if (data === "style_use_last") {
+    const s = getSession(userId);
+    if (!s.lastTransformInput) {
+      return sendMessage(chatId, "Нет последнего текста. Нажми «✍️ Ввести текст».", {
+        reply_markup: { inline_keyboard: [[{ text: "✍️ Ввести текст", callback_data: "style_input" }]] },
+      });
+    }
+    return processStyledText({ chatId, userId, incomingText: s.lastTransformInput });
   }
 
   if (data.startsWith("quick_delay_")) {
@@ -1221,6 +1761,31 @@ async function handleCallback(query) {
     return editMessageText(chatId, messageId, buildQuickStartText(), {
       parse_mode: "HTML",
       reply_markup: quickReplyKeyboard(userId),
+    });
+  }
+
+  if (data.startsWith("style_mode_")) {
+    const nextMode = data.replace("style_mode_", "");
+    const s = getSession(userId);
+    if (!STYLE_MODES[nextMode]) return;
+
+    if (
+      !isPremium(s) &&
+      ![PARAPHRASE_STYLE.NEUTRAL, PARAPHRASE_STYLE.POLITE].includes(nextMode)
+    ) {
+      return editMessageText(
+        chatId,
+        messageId,
+        "🔒 <b>Режимы доступны по подписке</b>\n\nОткрой пробную подписку за 0 ₽, чтобы включить расширенные стили.",
+        { parse_mode: "HTML", reply_markup: subKeyboard(userId) }
+      );
+    }
+
+    setSession(userId, { transformMode: nextMode });
+    await answerCallbackQuery(query.id, { text: `Стиль: ${STYLE_MODES[nextMode].label}` });
+    return editMessageText(chatId, messageId, buildStyleStartText(), {
+      parse_mode: "HTML",
+      reply_markup: styleToolKeyboard(userId),
     });
   }
 
@@ -1496,9 +2061,14 @@ async function handleMessage(message) {
   if (message.chat.type !== "private") return;
 
   const s = getSession(userId);
-  if (!s.awaitingInput) return;
-
-  await sendDraftWithDelay({ chatId, userId, incomingText: text });
+  if (s.awaitingInput) {
+    await sendDraftWithDelay({ chatId, userId, incomingText: text });
+    return;
+  }
+  if (s.awaitingTransformInput) {
+    await processStyledText({ chatId, userId, incomingText: text });
+    return;
+  }
 }
 
 async function processUpdate(update) {
