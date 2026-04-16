@@ -7,2372 +7,454 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { PrismaClient } from "@prisma/client";
 
-const PORT = Number(process.env.PORT || 4010);
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
-const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const TELEGRAM_MODE = String(process.env.TELEGRAM_MODE || "polling").toLowerCase();
+const {
+  PORT = 4010,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_WEBHOOK_SECRET,
+  OPENAI_API_KEY,
+  OPENAI_MODEL = "gpt-4o-mini",
+  TELEGRAM_MODE = "polling",
+  PUBLIC_URL = "",
+  YOOKASSA_SHOP_ID = "",
+  YOOKASSA_SECRET_KEY = "",
+  ADMIN_IDS: envAdmin = "",
+  ADMIN_ID = "",
+  BOT_USERNAME = "",
+} = process.env;
 
-if (!TELEGRAM_BOT_TOKEN) {
-  console.error("TELEGRAM_BOT_TOKEN is missing in .env");
-  process.exit(1);
-}
-if (!TELEGRAM_WEBHOOK_SECRET) {
-  console.error("TELEGRAM_WEBHOOK_SECRET is missing in .env");
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_WEBHOOK_SECRET) {
+  console.error("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_WEBHOOK_SECRET");
   process.exit(1);
 }
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
-const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null;
-const PUBLIC_URL = String(process.env.PUBLIC_URL || "").trim().replace(/\/+$/, "");
-const YOOKASSA_SHOP_ID = String(process.env.YOOKASSA_SHOP_ID || "").trim();
-const YOOKASSA_SECRET_KEY = String(process.env.YOOKASSA_SECRET_KEY || "").trim();
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const YOOKASSA_API = "https://api.yookassa.ru/v3";
 const TRIAL_DAYS = 3;
-const ADMIN_FALLBACK_ID = "1441173568";
-const ADMIN_IDS = String(process.env.ADMIN_IDS || process.env.ADMIN_ID || "")
-  .split(",")
-  .map((v) => v.trim())
-  .filter(Boolean);
-if (!ADMIN_IDS.length) {
-  ADMIN_IDS.push(ADMIN_FALLBACK_ID);
-  console.warn(
-    `[admin] ADMIN_ID(S) не задан в .env, включен fallback admin id: ${ADMIN_FALLBACK_ID}`
-  );
-}
-let prisma = null;
-try {
-  prisma = new PrismaClient();
-} catch (e) {
-  console.warn("[prisma] disabled at startup:", e?.message || e);
-}
-const STATE_FILE = path.resolve(process.cwd(), "data", "bot-state.json");
+const ADMIN_IDS = [...new Set([...envAdmin.split(","), ADMIN_ID].map(s => s.trim()).filter(Boolean))];
+if (!ADMIN_IDS.length) ADMIN_IDS.push("1441173568");
 
-const app = express();
-app.use(express.json());
+const STATE_FILE = path.resolve(process.cwd(), "data", "bot-state.json");
+const app = express().use(express.json());
+
+let prisma;
+try { prisma = new PrismaClient(); } catch { prisma = null; }
 
 const MODES = {
-  normal: {
-    label: "Обычный",
-    system: "Пиши естественный ответ как человек. 1-2 предложения, без лишней воды.",
-  },
-  short: {
-    label: "Коротко",
-    system: "Пиши очень кратко: 1 предложение, по сути, без вступлений.",
-  },
-  polite: {
-    label: "Вежливо",
-    system: "Пиши максимально вежливо и уважительно, но коротко и понятно.",
-  },
-  tothepoint: {
-    label: "По делу",
-    system: "Пиши строго по делу, факты и действие, без лишних слов.",
-  },
-  refuse: {
-    label: "Отказать",
-    system: "Сформулируй мягкий и корректный отказ, без грубости.",
-  },
-  busy: {
-    label: "Занят",
-    system: "Сформулируй короткий ответ, что сейчас занят и вернешься позже.",
-  },
+  normal:   { label: "Обычный",   prompt: "Пиши естественный ответ как человек. 1-2 предложения." },
+  short:    { label: "Коротко",  prompt: "Пиши очень кратко: 1 предложение, по сути." },
+  polite:   { label: "Вежливо",  prompt: "Пиши максимально вежливо, но коротко." },
+  tothepoint:{ label: "По делу", prompt: "Пиши строго по делу, факты, без воды." },
+  refuse:   { label: "Отказать", prompt: "Сформулируй мягкий и корректный отказ." },
+  busy:     { label: "Занят",    prompt: "Сформулируй, что занят и вернёшься позже." },
 };
 
-/** @typedef {"business"|"polite"|"friendly"|"casual"|"short"|"formal"|"neutral"} ParaphraseStyle */
-const PARAPHRASE_STYLE = Object.freeze({
-  BUSINESS: "business",
-  POLITE: "polite",
-  FRIENDLY: "friendly",
-  CASUAL: "casual",
-  SHORT: "short",
-  FORMAL: "formal",
-  NEUTRAL: "neutral",
-});
-
-const STYLE_MODES = {
-  [PARAPHRASE_STYLE.BUSINESS]: {
-    label: "💼 Деловой",
-    instruction:
-      [
-        "Стиль: business (деловой).",
-        "Тон: профессиональный, уверенный, конструктивный.",
-        "Лексика: без сленга, без эмоциональных междометий, без фамильярности.",
-        "Синтаксис: четкие формулировки, логичная структура, акцент на действии/результате.",
-        "Обязательно заметно перефразируй текст (не дословно).",
-      ].join(" "),
-  },
-  [PARAPHRASE_STYLE.POLITE]: {
-    label: "🤝 Вежливый",
-    instruction:
-      [
-        "Стиль: polite (вежливый).",
-        "Тон: уважительный, мягкий, аккуратный.",
-        "Лексика: корректные формулировки, допустимы слова 'пожалуйста', 'буду признателен(на)'.",
-        "Синтаксис: плавные и тактичные обороты, без давления.",
-        "Обязательно заметно перефразируй текст (не дословно).",
-      ].join(" "),
-  },
-  [PARAPHRASE_STYLE.FRIENDLY]: {
-    label: "🙂 Дружелюбный",
-    instruction:
-      [
-        "Стиль: friendly (дружелюбный).",
-        "Тон: теплый, живой, естественный, как в комфортном личном общении.",
-        "Лексика: простая, человечная, без канцелярита.",
-        "Синтаксис: легко читаемые фразы, допустим разговорный ритм.",
-        "Обязательно заметно перефразируй текст (не дословно).",
-      ].join(" "),
-  },
-  [PARAPHRASE_STYLE.CASUAL]: {
-    label: "🧢 Неформальный",
-    instruction:
-      [
-        "Стиль: casual (неформальный).",
-        "Тон: разговорный, простой, без официоза.",
-        "Лексика: бытовая и короткая, но без грубости.",
-        "Синтаксис: компактные естественные фразы, можно чуть проще по конструкции.",
-        "Обязательно заметно перефразируй текст (не дословно).",
-      ].join(" "),
-  },
-  [PARAPHRASE_STYLE.SHORT]: {
-    label: "⚡ Кратко",
-    instruction:
-      [
-        "Стиль: short (кратко).",
-        "Тон: нейтрально-деловой, по сути.",
-        "Длина: 1-2 коротких предложения.",
-        "Смысл: сжать формулировку, но не терять факты (имена, даты, время, числа, ссылки, условия).",
-        "Обязательно заметно перефразируй текст (не дословно).",
-      ].join(" "),
-  },
-  [PARAPHRASE_STYLE.FORMAL]: {
-    label: "🏛 Официальный",
-    instruction:
-      [
-        "Стиль: formal (официальный).",
-        "Тон: строго официальный, нейтральный, выдержанный.",
-        "Лексика: деловая/официальная, без разговорных слов.",
-        "Синтаксис: аккуратные завершенные формулировки, возможно более книжные конструкции.",
-        "Обязательно заметно перефразируй текст (не дословно).",
-      ].join(" "),
-  },
-  [PARAPHRASE_STYLE.NEUTRAL]: {
-    label: "⚖️ Нейтральный",
-    instruction:
-      [
-        "Стиль: neutral (нейтральный).",
-        "Тон: спокойный, ровный, без оценочных эмоций.",
-        "Лексика: понятная и универсальная.",
-        "Синтаксис: чистые, естественные формулировки без канцелярита.",
-        "Обязательно заметно перефразируй текст (не дословно).",
-      ].join(" "),
-  },
+const STYLES = {
+  business:  { label:"💼 Деловой",     inst:"Деловой стиль: профессионально, без сленга." },
+  polite:    { label:"🤝 Вежливый",   inst:"Вежливый стиль: уважительно, мягко." },
+  friendly:  { label:"🙂 Дружелюбный",inst:"Дружелюбный стиль: тепло, естественно." },
+  casual:    { label:"🧢 Неформальный",inst:"Неформальный стиль: разговорно, просто." },
+  short:     { label:"⚡ Кратко",      inst:"Кратко: 1-2 предложения, только суть." },
+  formal:    { label:"🏛 Официальный", inst:"Официальный стиль: строго, нейтрально." },
+  neutral:   { label:"⚖️ Нейтральный", inst:"Нейтральный стиль: спокойно, без эмоций." },
 };
 
+/** @type {Map<string, any>} */
 const sessions = new Map();
-const replyKeyboardRemovedUsers = new Set();
+/** @type {Map<string, any>} */
 const pendingPayments = new Map();
+/** @type {Map<string, number>} */
 const usernameToId = new Map();
 const processedGroupSignals = new Set();
-let botUsernameCache = (process.env.TELEGRAM_BOT_USERNAME || "").trim();
-let prismaTelegramSchemaReady = Boolean(prisma);
-let prismaFallbackLogged = false;
 
-async function readStateFile() {
-  try {
-    const raw = await fs.readFile(STATE_FILE, "utf8");
-    const data = JSON.parse(raw);
-    return data && typeof data === "object" ? data : { users: {} };
-  } catch {
-    return { users: {} };
-  }
-}
+// --- Helpers ---
+const escapeHtml = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
+const isGroupChatId = id => String(id).startsWith("-");
+const cacheUsername = from => from?.username && usernameToId.set(from.username.toLowerCase(), from.id);
 
-async function writeStateFile(data) {
-  try {
-    await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
-    await fs.writeFile(STATE_FILE, JSON.stringify(data, null, 2), "utf8");
-  } catch (e) {
-    console.error("state write error:", e?.message || e);
-  }
-}
-
-async function fallbackUpsertUser(userId, username = null) {
-  const tg = String(userId);
-  const state = await readStateFile();
-  if (!state.users[tg]) {
-    state.users[tg] = {
-      telegramId: tg,
-      username: username || null,
-      subscriptionTil: null,
-      onboardingCompleted: false,
-      trialUsed: false,
-      groups: {},
-      createdAt: new Date().toISOString(),
-    };
-  } else if (username) {
-    state.users[tg].username = username;
-  }
-  if (typeof state.users[tg].onboardingCompleted !== "boolean") {
-    // Для старых пользователей считаем онбординг пройденным.
-    state.users[tg].onboardingCompleted = true;
-  }
-  if (typeof state.users[tg].trialUsed !== "boolean") {
-    state.users[tg].trialUsed = false;
-  }
-  if (!state.users[tg].groups || typeof state.users[tg].groups !== "object") {
-    state.users[tg].groups = {};
-  }
-  await writeStateFile(state);
-  return state.users[tg];
-}
-
-async function fallbackSetSubscription(userId, until) {
-  const tg = String(userId);
-  const state = await readStateFile();
-  if (!state.users[tg]) {
-    state.users[tg] = {
-      telegramId: tg,
-      username: null,
-      subscriptionTil: null,
-      onboardingCompleted: false,
-      trialUsed: false,
-      groups: {},
-      createdAt: new Date().toISOString(),
-    };
-  }
-  state.users[tg].subscriptionTil = until.toISOString();
-  await writeStateFile(state);
-}
-
-async function hasUsedTrial(userId, username = null) {
-  const user = await fallbackUpsertUser(userId, username);
-  return Boolean(user?.trialUsed);
-}
-
-async function markTrialUsed(userId, username = null) {
-  const tg = String(userId);
-  const state = await readStateFile();
-  if (!state.users[tg]) {
-    state.users[tg] = {
-      telegramId: tg,
-      username: username || null,
-      subscriptionTil: null,
-      onboardingCompleted: false,
-      trialUsed: true,
-      groups: {},
-      createdAt: new Date().toISOString(),
-    };
-  } else {
-    if (username) state.users[tg].username = username;
-    state.users[tg].trialUsed = true;
-  }
-  await writeStateFile(state);
-}
-
-async function fallbackUpsertGroupForUser(userId, chat) {
-  const tg = String(userId);
-  const state = await readStateFile();
-  if (!state.users[tg]) {
-    state.users[tg] = {
-      telegramId: tg,
-      username: null,
-      subscriptionTil: null,
-      onboardingCompleted: false,
-      trialUsed: false,
-      groups: {},
-      createdAt: new Date().toISOString(),
-    };
-  }
-  if (!state.users[tg].groups || typeof state.users[tg].groups !== "object") {
-    state.users[tg].groups = {};
-  }
-
-  const groupId = String(chat?.id);
-  const prev = state.users[tg].groups[groupId] || {};
-  state.users[tg].groups[groupId] = {
-    id: groupId,
-    title: chat?.title || chat?.username || "Группа",
-    type: chat?.type || "group",
-    enabled: typeof prev.enabled === "boolean" ? prev.enabled : true,
-    lastSeenAt: new Date().toISOString(),
-  };
-
-  await writeStateFile(state);
-  return state.users[tg].groups[groupId];
-}
-
-async function getUserGroups(userId) {
-  const user = await fallbackUpsertUser(userId, null);
-  const groupsObj = user?.groups && typeof user.groups === "object" ? user.groups : {};
-  return Object.values(groupsObj).sort((a, b) => {
-    const ta = new Date(a?.lastSeenAt || 0).getTime();
-    const tb = new Date(b?.lastSeenAt || 0).getTime();
-    return tb - ta;
+const getSession = uid => {
+  const key = String(uid);
+  if (!sessions.has(key)) sessions.set(key, {
+    mode: "normal", transformMode: "neutral", delaySec: 10,
+    awaitingInput: false, awaitingTransformInput: false,
+    lastIncomingText: "", lastDraft: "", lastTransformInput: "", lastTransformText: "",
+    subscriptionUntil: null, trialUsed: false,
   });
-}
-
-async function setGroupEnabledForUser(userId, groupId, enabled) {
-  const tg = String(userId);
-  const gid = String(groupId);
-  const state = await readStateFile();
-  if (!state.users[tg]) {
-    state.users[tg] = {
-      telegramId: tg,
-      username: null,
-      subscriptionTil: null,
-      onboardingCompleted: false,
-      trialUsed: false,
-      groups: {},
-      createdAt: new Date().toISOString(),
-    };
-  }
-  if (!state.users[tg].groups || typeof state.users[tg].groups !== "object") {
-    state.users[tg].groups = {};
-  }
-  const prev = state.users[tg].groups[gid] || { id: gid, title: "Группа", type: "group" };
-  state.users[tg].groups[gid] = {
-    ...prev,
-    enabled: Boolean(enabled),
-    lastSeenAt: new Date().toISOString(),
-  };
-  await writeStateFile(state);
-  return state.users[tg].groups[gid];
-}
-
-async function isGroupEnabledForUser(userId, groupId) {
-  const groups = await getUserGroups(userId);
-  const row = groups.find((g) => String(g.id) === String(groupId));
-  if (!row) return true;
-  return Boolean(row.enabled);
-}
-
-async function getOnboardingCompleted(userId, username = null) {
-  const user = await fallbackUpsertUser(userId, username);
-  return Boolean(user?.onboardingCompleted);
-}
-
-async function setOnboardingCompleted(userId, done, username = null) {
-  const tg = String(userId);
-  const state = await readStateFile();
-  if (!state.users[tg]) {
-    state.users[tg] = {
-      telegramId: tg,
-      username: username || null,
-      subscriptionTil: null,
-      onboardingCompleted: Boolean(done),
-      createdAt: new Date().toISOString(),
-    };
-  } else {
-    if (username) state.users[tg].username = username;
-    state.users[tg].onboardingCompleted = Boolean(done);
-  }
-  await writeStateFile(state);
-}
-
-function escapeHtml(input = "") {
-  return String(input)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function getSession(userId) {
-  const key = String(userId);
-  if (!sessions.has(key)) {
-    sessions.set(key, {
-      mode: "normal",
-      transformMode: PARAPHRASE_STYLE.NEUTRAL,
-      delaySec: 10,
-      awaitingInput: false,
-      awaitingTransformInput: false,
-      pendingClarifyText: "",
-      lastIncomingText: "",
-      lastDraft: "",
-      lastTransformInput: "",
-      lastTransformText: "",
-      subscriptionUntil: null,
-      trialUsed: false,
-      pendingTimer: null,
-      pendingToken: null,
-    });
-  }
   return sessions.get(key);
-}
+};
 
-function setSession(userId, patch) {
-  const s = getSession(userId);
-  Object.assign(s, patch);
-  sessions.set(String(userId), s);
-  return s;
-}
+// --- State file fallback ---
+const readState = async () => {
+  try { return JSON.parse(await fs.readFile(STATE_FILE, "utf8")); } catch { return { users: {} }; }
+};
+const writeState = async data => {
+  await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
+  await fs.writeFile(STATE_FILE, JSON.stringify(data, null, 2));
+};
 
-function isAdmin(userId) {
-  return ADMIN_IDS.includes(String(userId));
-}
+const fallbackUser = async (uid, uname) => {
+  const id = String(uid);
+  const state = await readState();
+  state.users[id] = state.users[id] || { telegramId: id, username: uname, subscriptionTil: null, trialUsed: false, groups: {} };
+  if (uname) state.users[id].username = uname;
+  await writeState(state);
+  return state.users[id];
+};
 
-function cacheUsername(from) {
+const ensureUser = async (uid, uname) => {
+  const id = String(uid);
   try {
-    const uname = from?.username ? String(from.username).toLowerCase() : null;
-    const uid = from?.id;
-    if (!uname || !uid) return;
-    usernameToId.set(uname, Number(uid));
-  } catch {}
-}
+    return await prisma.user.upsert({ where: { telegramId: id }, update: { username: uname }, create: { telegramId: id, username: uname } });
+  } catch { return fallbackUser(uid, uname); }
+};
 
-function extractMentionedUserId(message, text) {
-  const raw = String(text || "");
-  try {
-    const entities = message?.entities || message?.caption_entities || [];
-    for (const ent of entities) {
-      if (ent?.type === "text_mention" && ent?.user?.id) {
-        return Number(ent.user.id);
-      }
-      if (
-        ent?.type === "mention" &&
-        typeof ent?.offset === "number" &&
-        typeof ent?.length === "number"
-      ) {
-        const chunk = raw.slice(ent.offset, ent.offset + ent.length);
-        const uname = chunk.startsWith("@") ? chunk.slice(1).toLowerCase() : chunk.toLowerCase();
-        const id = usernameToId.get(uname);
-        if (id) return Number(id);
-      }
-    }
-  } catch {}
-
-  const rx = raw.match(/(^|\s)@([a-zA-Z0-9_]{3,32})\b/);
-  if (rx?.[2]) {
-    const id = usernameToId.get(String(rx[2]).toLowerCase());
-    if (id) return Number(id);
-  }
-  return null;
-}
-
-async function ensureUserAndHydrateSession(userId, username = null) {
-  const telegramId = String(userId);
-  const uname = username ? String(username) : null;
-  const trialUsed = await hasUsedTrial(userId, uname);
-  if (prismaTelegramSchemaReady) {
-    try {
-      const user = await prisma.user.upsert({
-        where: { telegramId },
-        update: { ...(uname ? { username: uname } : {}) },
-        create: { telegramId, username: uname, style: "default" },
-      });
-
-      setSession(userId, {
-        subscriptionUntil: user?.subscriptionTil ? new Date(user.subscriptionTil).toISOString() : null,
-        trialUsed,
-      });
-
-      return user;
-    } catch (e) {
-      const msg = String(e?.message || "");
-      if (msg.includes("Unknown argument `telegramId`") || msg.includes("Invalid `prisma.user.upsert()` invocation")) {
-        prismaTelegramSchemaReady = false;
-        if (!prismaFallbackLogged) {
-          prismaFallbackLogged = true;
-          console.warn("[prisma] telegramId schema mismatch, switched to file-state fallback");
-        }
-        const user = await fallbackUpsertUser(userId, uname);
-        setSession(userId, {
-          subscriptionUntil: user?.subscriptionTil ? new Date(user.subscriptionTil).toISOString() : null,
-          trialUsed: Boolean(user?.trialUsed),
-        });
-        return user;
-      }
-      console.error("prisma upsert fallback:", msg);
-    }
-  }
-
-  const user = await fallbackUpsertUser(userId, uname);
-  setSession(userId, {
-    subscriptionUntil: user?.subscriptionTil ? new Date(user.subscriptionTil).toISOString() : null,
-    trialUsed: Boolean(user?.trialUsed),
-  });
+const hydrateSession = async (uid, uname) => {
+  const user = await ensureUser(uid, uname);
+  const s = getSession(uid);
+  s.subscriptionUntil = user.subscriptionTil?.toISOString?.() || null;
+  s.trialUsed = !!user.trialUsed;
   return user;
-}
+};
 
-function getTariffByAction(action) {
-  const tariffs = {
-    buy_7: { code: "7", title: "Неделя", price: 150, days: 7 },
-    buy_30: { code: "30", title: "Месяц", price: 450, days: 30 },
-    buy_180: { code: "180", title: "Полгода", price: 1990, days: 180 },
-    buy_365: { code: "365", title: "Год", price: 3184, days: 365 },
-  };
-  return tariffs[action] || null;
-}
+const isPremium = s => s.subscriptionUntil && new Date(s.subscriptionUntil) > new Date();
 
-function getYooAuthHeader() {
-  const raw = `${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`;
-  return `Basic ${Buffer.from(raw).toString("base64")}`;
-}
+// --- Telegram API ---
+const tg = async (method, payload) => {
+  const res = await axios.post(`${TELEGRAM_API}/${method}`, payload);
+  if (!res.data?.ok) throw new Error(`TG API ${method} failed`);
+  return res.data.result;
+};
 
-async function activateSubscription(userId, days, username = null) {
-  const user = await ensureUserAndHydrateSession(userId, username);
-  const now = new Date();
-  let base = now;
-  if (user?.subscriptionTil) {
-    const old = new Date(user.subscriptionTil);
-    if (!Number.isNaN(old.getTime()) && old > now) base = old;
-  }
-  const until = new Date(base);
-  until.setDate(until.getDate() + Number(days || 0));
-  if (prismaTelegramSchemaReady) {
-    try {
-      await prisma.user.update({
-        where: { telegramId: String(userId) },
-        data: { subscriptionTil: until },
-      });
-    } catch (e) {
-      const msg = String(e?.message || "");
-      console.error("prisma update fallback:", msg);
-      prismaTelegramSchemaReady = false;
-      await fallbackSetSubscription(userId, until);
-    }
-  } else {
-    await fallbackSetSubscription(userId, until);
-  }
-
-  setSession(userId, { subscriptionUntil: until.toISOString() });
-  return until;
-}
-
-async function createYooPayment({ userId, plan, username }) {
-  if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
-    throw new Error("YOOKASSA credentials are not configured");
-  }
-
-  const returnUrl = username ? `https://t.me/${username}` : "https://t.me";
-  const idempotenceKey = crypto.randomUUID();
-
-  const payload = {
-    amount: {
-      value: Number(plan.price).toFixed(2),
-      currency: "RUB",
-    },
-    capture: true,
-    confirmation: {
-      type: "redirect",
-      return_url: returnUrl,
-    },
-    description: `ИИ-секретарь: ${plan.title} (${plan.days} дн.)`,
-    metadata: {
-      user_id: String(userId),
-      plan_code: plan.code,
-      plan_days: String(plan.days),
-    },
-  };
-
-  const resp = await axios.post(`${YOOKASSA_API}/payments`, payload, {
-    headers: {
-      "Idempotence-Key": idempotenceKey,
-      Authorization: getYooAuthHeader(),
-      "Content-Type": "application/json",
-    },
-    timeout: 15000,
-  });
-
-  const payment = resp.data;
-  if (!payment?.id || !payment?.confirmation?.confirmation_url) {
-    throw new Error("Invalid YooKassa create payment response");
-  }
-
-  pendingPayments.set(String(payment.id), {
-    userId: String(userId),
-    days: plan.days,
-    title: plan.title,
-    price: plan.price,
-    createdAt: Date.now(),
-  });
-
-  return payment;
-}
-
-async function getYooPayment(paymentId) {
-  if (!YOOKASSA_SHOP_ID || !YOOKASSA_SECRET_KEY) {
-    throw new Error("YOOKASSA credentials are not configured");
-  }
-  const resp = await axios.get(`${YOOKASSA_API}/payments/${paymentId}`, {
-    headers: {
-      Authorization: getYooAuthHeader(),
-      "Content-Type": "application/json",
-    },
-    timeout: 15000,
-  });
-  return resp.data;
-}
-
-function isPremium(s) {
-  if (!s?.subscriptionUntil) return false;
-  const dt = new Date(s.subscriptionUntil);
-  if (Number.isNaN(dt.getTime())) return false;
-  return dt > new Date();
-}
-
-function isGroupChatId(chatId) {
-  if (typeof chatId === "number") return chatId < 0;
-  if (typeof chatId === "string") return chatId.startsWith("-");
-  return false;
-}
-
-function cancelPending(userId) {
-  const s = getSession(userId);
-  if (s.pendingTimer) {
-    try {
-      clearTimeout(s.pendingTimer);
-    } catch {}
-  }
-  setSession(userId, { pendingTimer: null, pendingToken: null });
-}
-
-async function tg(method, payload) {
-  const url = `${TELEGRAM_API}/${method}`;
-  const resp = await axios.post(url, payload);
-  if (!resp.data?.ok) {
-    throw new Error(`Telegram API ${method} failed: ${JSON.stringify(resp.data)}`);
-  }
-  return resp.data.result;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function stripHtmlTags(text = "") {
-  return String(text || "").replace(/<[^>]*>/g, "");
-}
-
-function isTelegramRetryableError(err) {
-  const msg = String(err?.message || "").toLowerCase();
-  const status = Number(err?.response?.status || 0);
-  if (status >= 500) return true;
-  if (msg.includes("timeout") || msg.includes("econnreset") || msg.includes("socket hang up")) return true;
-  return false;
-}
-
-function isTelegramParseModeError(err) {
-  const desc = String(err?.response?.data?.description || err?.message || "").toLowerCase();
-  return desc.includes("can't parse entities") || desc.includes("parse entities");
-}
-
-async function ensureWebhook() {
-  if (!PUBLIC_URL) {
-    console.log("PUBLIC_URL is not set, webhook auto-setup skipped");
-    return;
-  }
-
-  const webhookUrl = `${PUBLIC_URL}/webhook/${TELEGRAM_WEBHOOK_SECRET}`;
-
-  try {
-    await tg("setWebhook", { url: webhookUrl });
-    const info = await tg("getWebhookInfo", {});
-    console.log("Webhook set:", webhookUrl);
-    console.log("Webhook pending_update_count:", info?.pending_update_count ?? 0);
-    if (info?.last_error_message) {
-      console.log("Webhook last_error_message:", info.last_error_message);
-    }
-  } catch (e) {
-    console.error("Webhook setup failed:", e?.response?.data || e?.message || e);
-  }
-}
-
-async function sendMessage(chatId, text, extra = {}) {
-  // Бот ничего не пишет в группы/каналы.
+const sendMessage = async (chatId, text, extra = {}) => {
   if (isGroupChatId(chatId)) return null;
-
-  const basePayload = { chat_id: chatId, text, ...extra };
-  let lastErr = null;
-
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      return await tg("sendMessage", basePayload);
-    } catch (err) {
-      lastErr = err;
-
-      if (basePayload.parse_mode && isTelegramParseModeError(err)) {
-        try {
-          const fallbackPayload = { ...basePayload, text: stripHtmlTags(text) };
-          delete fallbackPayload.parse_mode;
-          return await tg("sendMessage", fallbackPayload);
-        } catch (fallbackErr) {
-          lastErr = fallbackErr;
-        }
-      }
-
-      if (attempt < 2 && isTelegramRetryableError(err)) {
-        await sleep(400);
-        continue;
-      }
-      break;
+  try { return await tg("sendMessage", { chat_id: chatId, text, ...extra }); } catch (e) {
+    if (extra.parse_mode && /parse entities/.test(e.message)) {
+      delete extra.parse_mode;
+      return tg("sendMessage", { chat_id: chatId, text: text.replace(/<[^>]*>/g, ""), ...extra });
     }
-  }
-
-  throw lastErr;
-}
-
-async function editMessageText(chatId, messageId, text, extra = {}) {
-  // Бот ничего не редактирует/не пишет в группы/каналы.
-  if (isGroupChatId(chatId)) return null;
-  try {
-    return await tg("editMessageText", {
-      chat_id: chatId,
-      message_id: messageId,
-      text,
-      ...extra,
-    });
-  } catch (e) {
-    const desc = e?.response?.data?.description || e?.message || "";
-    if (String(desc).includes("message is not modified")) return null;
     throw e;
   }
-}
+};
 
-async function answerCallbackQuery(callbackQueryId, extra = {}) {
-  try {
-    return await tg("answerCallbackQuery", { callback_query_id: callbackQueryId, ...extra });
-  } catch {
-    return null;
+const editMessage = async (chatId, msgId, text, extra = {}) => {
+  if (isGroupChatId(chatId)) return null;
+  try { return await tg("editMessageText", { chat_id: chatId, message_id: msgId, text, ...extra }); } catch (e) {
+    if (!/message is not modified/.test(e.message)) throw e;
   }
-}
+};
 
-async function ensureReplyKeyboardRemoved(chatId, userId) {
-  const key = String(userId || "");
-  if (!key || replyKeyboardRemovedUsers.has(key)) return;
-  replyKeyboardRemovedUsers.add(key);
+const answerCb = (id, extra) => tg("answerCallbackQuery", { callback_query_id: id, ...extra }).catch(()=>{});
 
-  try {
-    await sendMessage(chatId, "Старое меню скрыто.", {
-      reply_markup: { remove_keyboard: true },
-    });
-  } catch (e) {
-    console.error("remove_keyboard error:", e?.response?.data || e?.message || e);
-  }
-}
+// --- OpenAI ---
+const aiGenerate = async (prompt, system, temp=0.5, maxTokens=180) => {
+  if (!openai) return "";
+  const res = await openai.chat.completions.create({
+    model: OPENAI_MODEL, temperature: temp, max_tokens: maxTokens,
+    messages: [{ role: "system", content: system }, { role: "user", content: prompt }],
+  });
+  return res.choices[0]?.message?.content?.trim() || "";
+};
 
-async function resolveBotUsername() {
-  if (botUsernameCache) return botUsernameCache;
-  try {
-    const me = await tg("getMe", {});
-    if (me?.username) botUsernameCache = String(me.username);
-  } catch {}
-  return botUsernameCache;
-}
+const createDraft = async (text, mode) => {
+  const src = String(text).trim();
+  if (!src) return "Уточните, что ответить.";
+  const sys = `Ты помощник, генерируешь готовый ответ. ${MODES[mode]?.prompt || MODES.normal.prompt}`;
+  const draft = await aiGenerate(src, sys, 0.5, 180);
+  return draft || (mode==="short"?"Понял, отвечу позже.":"Принято, уточню детали.");
+};
 
-function homeKeyboard(userId, username) {
-  const s = getSession(userId);
-  const showTrialButton = !isPremium(s) && !s.trialUsed;
+const paraphrase = async (text, style) => {
+  const src = String(text).trim();
+  if (!src) return "";
+  const inst = STYLES[style]?.inst || STYLES.neutral.inst;
+  const sys = `Ты редактор. Перефразируй текст в заданном стиле. Только итоговый текст. ${inst}`;
+  const out = await aiGenerate(src, sys, 0.8, 320);
+  return out || src;
+};
+
+// --- Keyboard builders ---
+const homeKb = uid => {
+  const s = getSession(uid);
   const rows = [
-    [{ text: "✍️ Подготовить ответ", callback_data: "quick_reply_start" }],
-    [{ text: "🪄 Перефразировать текст", callback_data: "style_text_start" }],
+    [{ text: "✍️ Подготовить ответ", callback_data: "quick_start" }],
+    [{ text: "🪄 Перефразировать", callback_data: "style_start" }],
     [{ text: "💳 Подписка", callback_data: "menu_sub" }],
     [{ text: "⚙️ Настройки", callback_data: "menu_settings" }],
-    ...(showTrialButton ? [[{ text: "🎁 Пробная 0 ₽", callback_data: "buy_trial" }]] : []),
+  
   ];
+  if (!isPremium(s) && !s.trialUsed) rows.push([{ text: "🎁 Пробная 0 ₽", callback_data: "buy_trial" }]);
   return { inline_keyboard: rows };
-}
+};
 
-function quickReplyKeyboard(userId) {
-  const s = getSession(userId);
+const quickKb = uid => {
+  const s = getSession(uid);
   const premium = isPremium(s);
-
-  const modeButton = (key, label) => {
-    const mark = s.mode === key ? "✅ " : "";
-    const locked = !premium && !["normal", "short"].includes(key);
+  const btn = (key, label) => {
+    const locked = !premium && !["normal","short"].includes(key);
     return {
-      text: locked ? `🔒 ${label}` : `${mark}${label}`,
-      callback_data: locked ? "menu_sub" : `quick_mode_${key}`,
+      text: `${s.mode===key?"✅ ":""}${locked?"🔒 ":""}${label}`,
+      callback_data: locked ? "menu_sub" : `mode_${key}`,
     };
   };
+  return { inline_keyboard: [
+    [btn("normal","🧠 Обычный"), btn("short","⚡ Коротко")],
+    [btn("polite","🤝 Вежливо"), btn("tothepoint","🎯 По делу")],
+    [btn("refuse","🙅 Отказать"), btn("busy","⏳ Занят")],
+    [{ text: `${s.delaySec===10?"✅ ":""}⏱ 10 сек`, callback_data:"delay_10" },
+     { text: `${s.delaySec===20?"✅ ":""}⏱ 20 сек`, callback_data:"delay_20" }],
+    [{ text: "✍️ Ввести текст", callback_data: "quick_input" }],
+    ...(s.lastIncomingText ? [[{ text: "⚡ Ответить на последнее", callback_data: "quick_use_last" }]] : []),
+    [{ text: "⬅ Назад", callback_data: "menu_home" }],
+  ]};
+};
 
-  const delayButton = (sec) => ({
-    text: `${s.delaySec === sec ? "✅ " : ""}⏱ ${sec} сек`,
-    callback_data: `quick_delay_${sec}`,
-  });
-
-  return {
-    inline_keyboard: [
-      [modeButton("normal", "🧠 Обычный"), modeButton("short", "⚡ Коротко")],
-      [modeButton("polite", "🤝 Вежливо"), modeButton("tothepoint", "🎯 По делу")],
-      [modeButton("refuse", "🙅 Отказать"), modeButton("busy", "⏳ Занят")],
-      [delayButton(10), delayButton(20)],
-      [{ text: "✍️ Ввести текст", callback_data: "quick_input" }],
-      ...(s.lastIncomingText
-        ? [[{ text: "⚡ Ответить на последнее", callback_data: "quick_use_last" }]]
-        : []),
-      [{ text: "⬅ Назад", callback_data: "menu_home" }],
-    ],
-  };
-}
-
-function settingsKeyboard(username) {
-  const rows = [
-    [{ text: "👥 Группы (подсказки)", callback_data: "connect_chat" }],
-    [{ text: "❓ Помощь", callback_data: "help_how" }],
-    [{ text: "💳 Подписка", callback_data: "menu_sub" }],
-    [{ text: "🔄 Пройти онбординг заново", callback_data: "onboarding_restart" }],
-  ];
-  rows.push([{ text: "⬅ Назад", callback_data: "menu_home" }]);
-  return { inline_keyboard: rows };
-}
-
-function formatShortDate(input) {
-  if (!input) return "";
-  const dt = new Date(input);
-  if (Number.isNaN(dt.getTime())) return "";
-  const d = dt.getDate();
-  const m = dt.getMonth() + 1;
-  const y = dt.getFullYear();
-  return `${d}/${m}/${y}`;
-}
-
-function formatUsDate(input) {
-  if (!input) return "";
-  const dt = new Date(input);
-  if (Number.isNaN(dt.getTime())) return "";
-  const m = dt.getMonth() + 1;
-  const d = dt.getDate();
-  const y = dt.getFullYear();
-  return `${m}/${d}/${y}`;
-}
-
-function getStyleFromMode(mode) {
-  const map = {
-    normal: "Обычный",
-    short: "Короткий",
-    polite: "Вежливый",
-    tothepoint: "По делу",
-    refuse: "Строгий",
-    busy: "Сдержанный",
-  };
-  return map[mode] || "Обычный";
-}
-
-function buildHomeText(userId) {
-  const s = getSession(userId);
-  const showUpsell = !isPremium(s) && !s.trialUsed;
-  return (
-    "🤖 <b>Готовые ответы для твоих чатов - за 10 секунд</b>\n\n" +
-    "Две функции:\n" +
-    "• <b>Подготовить ответ</b> — когда тебе задали вопрос, а ты хочешь быстро отправить готовый ответ.\n" +
-    "• <b>Перефразировать текст</b> — когда нужно переписать любое сообщение под нужный стиль.\n\n" +
-    "<b>Что сделать сейчас:</b>\n" +
-    "1) Нажми ✍️ <b>Подготовить ответ</b>\n" +
-    "2) Или выбери 🪄 <b>Перефразировать текст</b>\n" +
-    "3) Выбери режим и отправь текст\n" +
-    "4) Скопируй готовый вариант\n\n" +
-    "Пример:\n" +
-    "«Можно созвониться завтра?» ->\n" +
-    "«Да, давай после 16:00. Напиши, какое время тебе удобно»\n\n" +
-    "🆓 Бесплатно: 5 черновиков в день.\n" +
-    (showUpsell ? "🎁 Все режимы и больше вариантов доступны в подписке. Начни с <b>пробной 0 ₽</b>.\n\n" : "\n") +
-    "👇 Нажми кнопку ниже и попробуй."
-  );
-}
-
-function buildQuickStartText() {
-  return (
-    "✍️ <b>Подготовить первый ответ</b>\n\n" +
-    "Пришли сюда <b>одно сообщение</b> - текст, на который ты хочешь ответить.\n" +
-    "Я предложу готовый вариант, а ты его скопируешь и отправишь сам.\n\n" +
-    "⏱ Задержка — это пауза перед ответом. Так переписка выглядит естественно.\n\n" +
-    "Пример:\n" +
-    "«Можно созвониться завтра?» -> «Да, давай после 16:00. Какое время тебе удобно?»\n\n" +
-    "👇 Просто отправь сюда сообщение - и я предложу готовый ответ."
-  );
-}
-
-function styleToolKeyboard(userId) {
-  const s = getSession(userId);
+const styleKb = uid => {
+  const s = getSession(uid);
   const premium = isPremium(s);
-
-  const modeButton = (key, label) => {
-    const mark = s.transformMode === key ? "✅ " : "";
-    const locked = !premium && ![PARAPHRASE_STYLE.NEUTRAL, PARAPHRASE_STYLE.POLITE].includes(key);
+  const btn = (key, label) => {
+    const locked = !premium && !["neutral","polite"].includes(key);
     return {
-      text: locked ? `🔒 ${label}` : `${mark}${label}`,
-      callback_data: locked ? "menu_sub" : `style_mode_${key}`,
+      text: `${s.transformMode===key?"✅ ":""}${locked?"🔒 ":""}${label}`,
+      callback_data: locked ? "menu_sub" : `style_${key}`,
     };
   };
+  return { inline_keyboard: [
+    [btn("business","💼 Деловой"), btn("polite","🤝 Вежливый")],
+    [btn("friendly","🙂 Дружелюбный"), btn("casual","🧢 Неформальный")],
+    [btn("short","⚡ Кратко"), btn("formal","🏛 Официальный")],
+    [btn("neutral","⚖️ Нейтральный")],
+    [{ text: "✍️ Ввести текст", callback_data: "style_input" }],
+    ...(s.lastTransformInput ? [[{ text: "🔁 Обработать последнее", callback_data: "style_use_last" }]] : []),
+    [{ text: "⬅ Назад", callback_data: "menu_home" }],
+  ]};
+};
 
-  return {
-    inline_keyboard: [
-      [
-        modeButton(PARAPHRASE_STYLE.BUSINESS, "💼 Деловой"),
-        modeButton(PARAPHRASE_STYLE.POLITE, "🤝 Вежливый"),
-      ],
-      [
-        modeButton(PARAPHRASE_STYLE.FRIENDLY, "🙂 Дружелюбный"),
-        modeButton(PARAPHRASE_STYLE.CASUAL, "🧢 Неформальный"),
-      ],
-      [
-        modeButton(PARAPHRASE_STYLE.SHORT, "⚡ Кратко"),
-        modeButton(PARAPHRASE_STYLE.FORMAL, "🏛 Официальный"),
-      ],
-      [modeButton(PARAPHRASE_STYLE.NEUTRAL, "⚖️ Нейтральный")],
-      [{ text: "✍️ Ввести текст", callback_data: "style_input" }],
-      ...(s.lastTransformInput
-        ? [[{ text: "🔁 Обработать последнее", callback_data: "style_use_last" }]]
-        : []),
-      [{ text: "⬅ Назад", callback_data: "menu_home" }],
-    ],
-  };
-}
+const subKb = uid => ({
+  inline_keyboard: [
+    ...(!getSession(uid).trialUsed ? [[{ text: "🎁 Пробная — 0 ₽", callback_data: "buy_trial" }]] : []),
+    [{ text: "Неделя — 150 ₽", callback_data: "buy_7" }],
+    [{ text: "Месяц — 450 ₽", callback_data: "buy_30" }],
+    [{ text: "Полгода — 1990 ₽", callback_data: "buy_180" }],
+    [{ text: "Год — 3184 ₽", callback_data: "buy_365" }],
+    [{ text: "⬅️ Назад", callback_data: "menu_home" }],
+  ],
+});
 
-function styleResultKeyboard(userId) {
-  const s = getSession(userId);
-  return {
-    inline_keyboard: [
-      [{ text: "📋 Скопировать", callback_data: "style_copy" }],
-      [{ text: "🔄 Еще вариант", callback_data: "style_regen" }],
-      [{ text: "🎨 Другой стиль", callback_data: "style_text_start" }],
-      ...(!isPremium(s) && !s.trialUsed
-        ? [
-            [{ text: "🎁 Пробная 0 ₽", callback_data: "buy_trial" }],
-            [{ text: "✨ Что дает подписка", callback_data: "sub_benefits" }],
-          ]
-        : []),
+// --- Handlers ---
+const sendDraft = async (chatId, uid, incoming) => {
+  const s = getSession(uid);
+  await sendMessage(chatId, `⏳ Думаю… пришлю через ${s.delaySec} сек.`);
+  setTimeout(async () => {
+    const draft = await createDraft(incoming, s.mode);
+    s.lastDraft = draft; s.lastIncomingText = incoming;
+    await sendMessage(chatId, `📝 <b>Готовый ответ:</b>\n\n${escapeHtml(draft)}\n\n<i>(Скопируй и отправь)</i>`, {
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [
+        [{ text: "📋 Скопировать", callback_data: "copy_draft" }],
+        [{ text: "🔄 Ещё вариант", callback_data: "regen_draft" }],
+        ...(!isPremium(s)&&!s.trialUsed?[[{ text: "🎁 Пробная 0 ₽", callback_data: "buy_trial" }]]:[]),
+        [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
+      ]},
+    });
+  }, s.delaySec * 1000);
+};
+
+const processStyle = async (chatId, uid, text) => {
+  const s = getSession(uid);
+  await sendMessage(chatId, "🪄 Перефразирую…");
+  const result = await paraphrase(text, s.transformMode);
+  s.lastTransformInput = text; s.lastTransformText = result;
+  await sendMessage(chatId, `📝 <b>Перефразированный текст:</b>\n\n${escapeHtml(result)}\n\n<i>Стиль: ${STYLES[s.transformMode].label}</i>`, {
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [
+      [{ text: "📋 Скопировать", callback_data: "copy_style" }],
+      [{ text: "🔄 Ещё вариант", callback_data: "regen_style" }],
+      [{ text: "🎨 Другой стиль", callback_data: "style_start" }],
       [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
-    ],
-  };
-}
+    ]},
+  });
+};
 
-function buildStyleStartText() {
-  return (
-    "🪄 <b>Перефразировать текст</b>\n\n" +
-    "Это отдельная функция ИИ-редактора.\n" +
-    "Она <b>не отвечает</b> на твой текст, а только переписывает его в выбранном стиле.\n\n" +
-    "Стили для перефраза:\n" +
-    "• 💼 Деловой\n" +
-    "• 🤝 Вежливый\n" +
-    "• 🙂 Дружелюбный\n" +
-    "• 🧢 Неформальный\n" +
-    "• ⚡ Кратко\n" +
-    "• 🏛 Официальный\n" +
-    "• ⚖️ Нейтральный\n\n" +
-    "👇 Выбери стиль и нажми «Ввести текст»."
-  );
-}
-
-function buildSettingsText(userId) {
-  const s = getSession(userId);
-  const styleLabel = getStyleFromMode(s.mode);
-  const subLabel = isPremium(s)
-    ? `✅ активна до ${formatShortDate(s.subscriptionUntil)}`
-    : "🆓 бесплатный режим";
-
-  return (
-    "⚙️ <b>Настройки</b>\n\n" +
-    "Здесь ты управляешь ботом: подпиской, подсказками для групп и справкой.\n\n" +
-    `💳 <b>Подписка:</b> ${subLabel}\n` +
-    `🎨 <b>Стиль:</b> ${escapeHtml(styleLabel)}`
-  );
-}
-
-function buildHelpText() {
-  return (
-    "🆘 <b>Помощь</b>\n\n" +
-    "Доступные команды:\n" +
-    "• /start - главное меню\n" +
-    "• /status - твой статус и подписка\n" +
-    "• /profile - профиль (то же, что /status)\n" +
-    "• /help - эта справка\n" +
-    "• /onboarding - пройти онбординг заново\n\n" +
-    "Если бот не отвечает:\n" +
-    "1) Нажми /start ещё раз\n" +
-    "2) Подожди 10-20 секунд и отправь сообщение повторно\n" +
-    "3) Перезапусти Telegram и открой чат с ботом заново\n" +
-    "4) Если проблема осталась — напиши в поддержку @assistly_support_bot и приложи скрин\n\n" +
-    "Основное управление - через кнопки в меню."
-  );
-}
-
-function buildSubText(userId) {
-  const s = getSession(userId);
-  const status = isPremium(s)
-    ? `✅ Активна до ${formatUsDate(s.subscriptionUntil)}`
-    : "❌ Нет активной подписки";
-  return (
-    "💳 <b>Подписка на ИИ-секретаря</b>\n\n" +
-    "Что даёт подписка:\n" +
-    "• 🔗 черновики автоответчика в личке (без лимита)\n" +
-    "• 🎭 стили общения\n" +
-    "• 🧠 личный промпт\n" +
-    "• 🧾 логи сообщений\n\n" +
-    "Бесплатно доступно:\n" +
-    "• базовые ответы\n" +
-    "• автоответчик-черновики: 5/день\n\n" +
-    `Статус: ${status}\n\n` +
-    "Выберите тариф ниже:"
-  );
-}
-
-function subKeyboard(userId) {
-  const s = getSession(userId);
-  const canShowTrial = !s.trialUsed;
-  return {
-    inline_keyboard: [
-      ...(canShowTrial ? [[{ text: "🎁 Пробная — 0 ₽", callback_data: "buy_trial" }]] : []),
-      [{ text: "Неделя — 150 ₽", callback_data: "buy_7" }],
-      [{ text: "Месяц — 450 ₽", callback_data: "buy_30" }],
-      [{ text: "Полгода — 1990 ₽", callback_data: "buy_180" }],
-      [{ text: "Год — 3184 ₽", callback_data: "buy_365" }],
-      [{ text: "🔄 Обновить", callback_data: "menu_sub" }],
-      [{ text: "⬅️ Назад", callback_data: "menu_home" }],
-    ],
-  };
-}
-
-function draftResultKeyboard(userId) {
-  const s = getSession(userId);
-  return {
-    inline_keyboard: [
-      [{ text: "📋 Скопировать", callback_data: "quick_copy" }],
-      [{ text: "🔄 Еще вариант", callback_data: "quick_reply_regen" }],
-      ...(!isPremium(s) && !s.trialUsed
-        ? [
-            [{ text: "🎁 Пробная 0 ₽", callback_data: "buy_trial" }],
-            [{ text: "✨ Что дает подписка", callback_data: "sub_benefits" }],
-          ]
-        : []),
-      [
-        { text: "✍️ Подготовить еще", callback_data: "quick_reply_start" },
-        { text: "🏠 Главное меню", callback_data: "menu_home" },
-      ],
-    ],
-  };
-}
-
-function assessDraftInput(text = "") {
-  const src = String(text || "").trim();
-  if (!src) {
-    return {
-      ready: false,
-      reason: "empty",
-      prompt:
-        "Пришли сообщение собеседника целиком или добавь контекст: что нужно ответить, какие условия и сроки важны.",
-    };
-  }
-
-  const normalized = src.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, " ").replace(/\s+/g, " ").trim();
-  const words = normalized ? normalized.split(" ").filter(Boolean) : [];
-  const chars = src.length;
-  const genericOnly = /^(ок|ага|понял|поняла|ясно|норм|спасибо|привет|добрый день|да|нет)$/i.test(normalized);
-
-  if (genericOnly) {
-    return {
-      ready: false,
-      reason: "generic",
-      prompt:
-        "Текст слишком общий. Добавь, пожалуйста, что именно нужно ответить: цель, условия, сроки/сумма или желаемый тон.",
-    };
-  }
-
-  if (chars < 8 || words.length < 2) {
-    return {
-      ready: false,
-      reason: "too_short",
-      prompt:
-        "Слишком мало данных для точного ответа. Добавь 1-2 детали: о чём вопрос, что важно по условиям, и какой результат нужен.",
-    };
-  }
-
-  const hasQuestion = /[?]/.test(src);
-  const hasIntentWords =
-    /\b(нужно|надо|сделать|ответить|подскажи|помоги|как|когда|почему|где|что|сколько|услов|срок|смет|цена|оплат|договор|результат)\b/i.test(
-      src
-    );
-
-  if (!hasQuestion && !hasIntentWords && words.length < 5) {
-    return {
-      ready: false,
-      reason: "unclear",
-      prompt:
-        "Не хватает контекста. Добавь, пожалуйста, что именно хочет собеседник и какие рамки важны (срок, сумма, условия).",
-    };
-  }
-
-  return { ready: true, reason: "ok", prompt: "" };
-}
-
-async function requestDraftClarification({ chatId, userId, promptText }) {
-  setSession(userId, { awaitingInput: true });
-  return sendMessage(
-    chatId,
-    "🧩 <b>Чтобы дать точный вариант, нужно чуть больше данных</b>\n\n" +
-      `${escapeHtml(promptText)}\n\n` +
-      "Можно сразу дописать детали одним сообщением или сгенерировать ответ как есть.",
-    {
-      parse_mode: "HTML",
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "⚡ Сгенерировать как есть", callback_data: "quick_force_generate" }],
-          [{ text: "✍️ Добавить детали", callback_data: "quick_add_details" }],
-          [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
-        ],
-      },
-    }
-  );
-}
-
-async function handleDraftRequest({ chatId, userId, incomingText, force = false }) {
-  const src = String(incomingText || "").trim();
-  const check = assessDraftInput(src);
-
-  setSession(userId, { lastIncomingText: src });
-
-  if (!force && !check.ready) {
-    setSession(userId, { pendingClarifyText: src });
-    await requestDraftClarification({ chatId, userId, promptText: check.prompt });
-    return;
-  }
-
-  setSession(userId, { pendingClarifyText: "", awaitingInput: false });
-  await sendDraftWithDelay({ chatId, userId, incomingText: src });
-}
-
-async function createDraft(incomingText, mode) {
-  const safeMode = MODES[mode] ? mode : "normal";
-  const modePrompt = MODES[safeMode].system;
-  const src = String(incomingText || "").trim();
-
-  const localFallbackDraft = (text, draftMode) => {
-    const t = String(text || "").trim();
-    if (!t) return "Понял. Что именно нужно ответить?";
-
-    const looksLikeQuestion = /\?|как\b|почему\b|когда\b|где\b|что\b|сколько\b/i.test(t);
-    const addOn = looksLikeQuestion ? " Если уточнишь пару деталей, отвечу точнее." : "";
-
-    const modeFallback = {
-      normal: "Понял. Сейчас подумаю и вернусь с ответом.",
-      short: "Понял, отвечу чуть позже.",
-      polite: "Благодарю за сообщение. Уточните, пожалуйста, детали, чтобы я ответил точнее.",
-      tothepoint: "Принято. Нужны сроки и конкретика для точного ответа.",
-      refuse: "Спасибо за предложение, но сейчас не смогу подключиться.",
-      busy: "Сейчас занят, вернусь с ответом чуть позже.",
-    };
-
-    return (modeFallback[draftMode] || modeFallback.normal) + addOn;
-  };
-
-  if (!openai) {
-    return localFallbackDraft(src, safeMode);
-  }
-
-  const withTimeout = async (promise, ms) => {
-    let timer = null;
-    try {
-      return await Promise.race([
-        promise,
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`openai timeout ${ms}ms`)), ms);
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  };
-
-  let lastError = null;
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      const completion = await withTimeout(
-        openai.chat.completions.create({
-          model: OPENAI_MODEL,
-          temperature: 0.5,
-          max_tokens: 180,
-          messages: [
-            {
-              role: "system",
-              content:
-                "Ты личный помощник по переписке. Генерируешь один готовый текст ответа, который пользователь скопирует и отправит сам. Без кавычек, без заголовков, без пояснений.",
-            },
-            {
-              role: "system",
-              content: modePrompt,
-            },
-            {
-              role: "user",
-              content: `Сообщение собеседника:\n${src}`,
-            },
-          ],
-        }),
-        15000
-      );
-
-      const text = completion.choices?.[0]?.message?.content?.trim();
-      if (text) return text;
-      lastError = new Error("empty model response");
-    } catch (err) {
-      lastError = err;
-      if (attempt < 2) continue;
-    }
-  }
-
-  console.error("createDraft fallback:", lastError?.message || lastError);
-  return localFallbackDraft(src, safeMode);
-}
-
-function sanitizeParaphraseOutput(text = "") {
-  let out = String(text || "").trim();
-  out = out.replace(/^["'«»]+|["'«»]+$/g, "").trim();
-
-  // Убираем служебные фразы модели, оставляем только сам переписанный текст.
-  const prefixes = [
-    /^вот\s+(?:перефразированный|переписанный)\s+(?:вариант|текст)\s*:\s*/i,
-    /^перефразированный\s+текст\s*:\s*/i,
-    /^переписанный\s+текст\s*:\s*/i,
-    /^вариант\s*:\s*/i,
-    /^ответ\s*:\s*/i,
-  ];
-  for (const rx of prefixes) out = out.replace(rx, "");
-
-  return out.trim();
-}
-
-/**
- * paraphraseStatement(...)
- * Перефразирует исходное утверждение под выбранный стиль.
- * Ничего не объясняет и не отвечает по сути сообщения.
- *
- * @param {string} incomingText
- * @param {ParaphraseStyle|string} style
- * @returns {Promise<string>}
- */
-async function paraphraseStatement(incomingText, style) {
-  const src = String(incomingText || "").trim();
-  if (!src) return "";
-
-  /** @type {ParaphraseStyle} */
-  const safeStyle = STYLE_MODES[String(style || "").toLowerCase()]
-    ? String(style || "").toLowerCase()
-    : PARAPHRASE_STYLE.NEUTRAL;
-  const styleInstruction = STYLE_MODES[safeStyle].instruction;
-
-  const fallbackParaphrase = () => {
-    const normalizeSpaces = (s) =>
-      String(s || "")
-        .replace(/\s+/g, " ")
-        .replace(/\s*([,!.?;:])/g, "$1")
-        .trim();
-    const lowerFirst = (s) => (s ? s.charAt(0).toLowerCase() + s.slice(1) : s);
-
-    const toSentences = (s) => {
-      const t = normalizeSpaces(s);
-      if (!t) return [];
-      const arr = t.split(/(?<=[.!?])\s+/).filter(Boolean);
-      return arr.length ? arr : [t];
-    };
-
-    const applyReplacements = (text, pairs) => {
-      let out = ` ${text} `;
-      for (const [rx, val] of pairs) out = out.replace(rx, val);
-      return normalizeSpaces(out);
-    };
-
-    const basePairs = [
-      [/\bа вообще вот\b/gi, ""],
-      [/\bа вообще\b/gi, ""],
-      [/\bвообще вот\b/gi, ""],
-      [/\bпотому что\b/gi, "так как"],
-      [/\bсозвон\b/gi, "звонок"],
-      [/\bдавай\b/gi, "предлагаю"],
-      [/\bнапиши\b/gi, "сообщи"],
-      [/\bкто-?нибудь\b/gi, "кто-то"],
-      [/\bпо нему\b/gi, "по этому проекту"],
-    ];
-    const businessPairs = [
-      [/\bпривет\b/gi, "Здравствуйте"],
-      [/\bсообщи\b/gi, "сообщите"],
-      [/\bудобнее\b/gi, "удобно"],
-      [/\bкто-то работает\b/gi, "ведется работа"],
-    ];
-    const politePairs = [
-      [/\bпривет\b/gi, "Здравствуйте"],
-      [/\bнапиши\b/gi, "подскажите, пожалуйста"],
-      [/\bсообщи\b/gi, "сообщите, пожалуйста"],
-    ];
-    const friendlyPairs = [
-      [/\bздравствуйте\b/gi, "Привет"],
-      [/\bсообщите\b/gi, "напиши"],
-    ];
-    const casualPairs = [
-      [/\bпредлагаю\b/gi, "давай"],
-      [/\bне получится\b/gi, "не выйдет"],
-      [/\bсообщите\b/gi, "напиши"],
-    ];
-    const formalPairs = [
-      [/\bпривет\b/gi, "Здравствуйте"],
-      [/\bдавай\b/gi, "предлагаю"],
-      [/\bнапиши\b/gi, "прошу сообщить"],
-      [/\bсообщи\b/gi, "прошу сообщить"],
-      [/\bтебе\b/gi, "вам"],
-    ];
-    const neutralPairs = [
-      [/\bдавай\b/gi, "предлагаю"],
-      [/\bнапиши\b/gi, "сообщи"],
-    ];
-
-    const sentences = toSentences(src);
-    let out = applyReplacements(src, basePairs);
-
-    if (safeStyle === PARAPHRASE_STYLE.BUSINESS) {
-      out = applyReplacements(out, businessPairs);
-      if (/\?$/.test(out)) {
-        const core = out.replace(/\?+$/, "").trim();
-        out = `Подскажите, ${lowerFirst(core)}?`;
-      }
-    } else if (safeStyle === PARAPHRASE_STYLE.POLITE) {
-      out = applyReplacements(out, politePairs);
-      if (/\?$/.test(out)) {
-        const core = out.replace(/\?+$/, "").trim();
-        out = `Подскажите, пожалуйста, ${lowerFirst(core)}?`;
-      }
-    } else if (safeStyle === PARAPHRASE_STYLE.FRIENDLY) {
-      out = applyReplacements(out, friendlyPairs);
-      if (/\?$/.test(out) && !/^слушай/i.test(out)) out = `Слушай, ${lowerFirst(out)}`;
-    } else if (safeStyle === PARAPHRASE_STYLE.CASUAL) {
-      out = applyReplacements(out, casualPairs);
-      if (/\?$/.test(out) && !/^слушай/i.test(out)) out = `Слушай, ${lowerFirst(out)}`;
-    } else if (safeStyle === PARAPHRASE_STYLE.FORMAL) {
-      out = applyReplacements(out, formalPairs);
-      if (/\?$/.test(out)) {
-        const core = out.replace(/\?+$/, "").trim();
-        out = `Прошу уточнить, ${lowerFirst(core)}.`;
-      }
-    } else if (safeStyle === PARAPHRASE_STYLE.NEUTRAL) {
-      out = applyReplacements(out, neutralPairs);
-    } else if (safeStyle === PARAPHRASE_STYLE.SHORT) {
-      // Кратко, но без потери ключевых фактов: берем до 2 предложений и ужимаем лексику.
-      const firstTwo = sentences.slice(0, 2).join(" ");
-      out = applyReplacements(firstTwo, basePairs);
-      out = out.replace(/\b(пожалуйста|прошу)\b/gi, "").replace(/\s+/g, " ").trim();
-      if (out.length > 170) out = `${out.slice(0, 167).trim()}...`;
-    }
-
-    // Если вдруг почти не изменилось — делаем минимальную гарантированную перестройку.
-    if (normalizeSpaces(out).toLowerCase() === normalizeSpaces(src).toLowerCase()) {
-      out = applyReplacements(src, [
-        [/\bа вообще вот\b/gi, ""],
-        [/\bпотому что\b/gi, "так как"],
-        [/\bдавай\b/gi, "предлагаю"],
-        [/\bнапиши\b/gi, "сообщи"],
-        [/\bкто-?нибудь\b/gi, "кто-то"],
-      ]);
-    }
-
-    return out;
-  };
-
-  if (!openai) return fallbackParaphrase();
-
-  try {
-    const rewriteRules = [
-      "Ты редактор уровня senior copywriter.",
-      "Задача: ПЕРЕФРАЗИРОВАТЬ исходный текст под заданный стиль.",
-      "Запрещено: отвечать на текст, советовать, спорить, анализировать, добавлять новые факты, удалять важные факты.",
-      "Обязательно: сохранить все факты, числа, даты, имена, ссылки, смысл и язык исходника.",
-      "Обязательно: выдать заметно перефразированный вариант, не копию оригинала.",
-      "Верни только итоговый текст без кавычек, без префиксов и без пояснений.",
-    ].join(" ");
-
-    const completion = await openai.chat.completions.create({
-      model: OPENAI_MODEL,
-      temperature: 0.8,
-      max_tokens: 320,
-      messages: [
-        {
-          role: "system",
-          content: rewriteRules,
-        },
-        { role: "system", content: styleInstruction },
-        {
-          role: "user",
-          content: [
-            `Стиль: ${safeStyle}`,
-            "Сделай переписывание в стиле выше.",
-            "Не давай ответ по смыслу сообщения. Только переформулируй исходник.",
-            "",
-            "Исходный текст:",
-            src,
-          ].join("\n"),
-        },
-      ],
-    });
-
-    const raw = completion.choices?.[0]?.message?.content?.trim() || "";
-    const clean = sanitizeParaphraseOutput(raw);
-    if (!clean) return fallbackParaphrase();
-
-    // Не допускаем 1-в-1 копию исходника: форсим стиль через fallback.
-    const norm = (s) =>
-      String(s || "")
-        .toLowerCase()
-        .replace(/\s+/g, " ")
-        .trim();
-    if (norm(clean) === norm(src)) return fallbackParaphrase();
-    return clean;
-  } catch (e) {
-    console.error("paraphraseStatement fallback:", e?.message || e);
-    return fallbackParaphrase();
-  }
-}
-
-// Backward compatibility with existing call sites.
-async function createStyledText(incomingText, mode) {
-  return paraphraseStatement(incomingText, mode);
-}
-
-async function sendDraftWithDelay({ chatId, userId, incomingText }) {
-  const s = getSession(userId);
-  cancelPending(userId);
-
-  try {
-    await sendMessage(chatId, `⏳ Думаю над ответом...\nПришлю вариант через ${s.delaySec} сек.`, {
-      parse_mode: "HTML",
-    });
-  } catch (e) {
-    console.error("thinking message error:", e?.message || e);
-  }
-
-  const token = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  setSession(userId, { pendingToken: token, lastIncomingText: incomingText, awaitingInput: false });
-
-  const timer = setTimeout(async () => {
-    const current = getSession(userId);
-    if (current.pendingToken !== token) return;
-
-    try {
-      const draft = await createDraft(incomingText, current.mode);
-      setSession(userId, { lastDraft: draft, pendingToken: null, pendingTimer: null });
-
-      const upsell = !isPremium(current)
-        ? "\n\n<b>Хочешь еще сильнее?</b>\nПодписка открывает режимы: <b>Вежливо, По делу, Отказать, Занят</b> и дает больше вариантов."
-        : "";
-
-      await sendMessage(
-        chatId,
-        "📝 <b>Готовый ответ:</b>\n\n" +
-          `${escapeHtml(draft)}\n\n` +
-          "<i>(Скопируй и отправь собеседнику)</i>" +
-          upsell,
-        {
-          parse_mode: "HTML",
-          reply_markup: draftResultKeyboard(userId),
-        }
-      );
-    } catch (err) {
-      console.error("draft generation error:", err?.message || err);
-      const backupDraft = "Принято. Уточню детали и вернусь с ответом.";
-      setSession(userId, { lastDraft: backupDraft });
-      await sendMessage(
-        chatId,
-        "📝 <b>Готовый ответ:</b>\n\n" + `${escapeHtml(backupDraft)}\n\n` + "<i>(Скопируй и отправь собеседнику)</i>",
-        {
-          parse_mode: "HTML",
-          reply_markup: draftResultKeyboard(userId),
-        }
-      );
-      setSession(userId, { pendingToken: null, pendingTimer: null });
-    }
-  }, Math.max(1, Number(s.delaySec || 10)) * 1000);
-
-  setSession(userId, { pendingTimer: timer });
-}
-
-async function processStyledText({ chatId, userId, incomingText }) {
-  const s = getSession(userId);
-  await sendMessage(chatId, "🪄 Перефразирую текст под выбранный стиль...", { parse_mode: "HTML" });
-
-  try {
-    const result = await createStyledText(incomingText, s.transformMode);
-    setSession(userId, {
-      lastTransformInput: incomingText,
-      lastTransformText: result,
-      awaitingTransformInput: false,
-      awaitingInput: false,
-    });
-
-    await sendMessage(
-      chatId,
-        "📝 <b>Перефразированный текст:</b>\n\n" +
-        `${escapeHtml(result)}\n\n` +
-        `<i>Стиль: ${escapeHtml(STYLE_MODES[s.transformMode]?.label || STYLE_MODES.business.label)}</i>\n\n` +
-        "<i>(Скопируй и используй)</i>",
-      {
-        parse_mode: "HTML",
-        reply_markup: styleResultKeyboard(userId),
-      }
-    );
-  } catch (err) {
-    console.error("style generation error:", err?.message || err);
-    await sendMessage(chatId, "Не получилось перефразировать текст. Попробуй еще раз.", {
-      reply_markup: { inline_keyboard: [[{ text: "🪄 Перефразировать текст", callback_data: "style_text_start" }]] },
-    });
-  }
-}
-
-async function notifyGroupQuestionToUser({ targetUserId, sourceMsg, incomingText }) {
-  const key = `${sourceMsg?.chat?.id}:${sourceMsg?.message_id}:${targetUserId}`;
+// --- Group signal ---
+const notifyGroup = async (targetId, msg, text) => {
+  const key = `${msg.chat.id}:${msg.message_id}:${targetId}`;
   if (processedGroupSignals.has(key)) return;
   processedGroupSignals.add(key);
+  const s = getSession(targetId);
+  if (!isPremium(s)) return;
+  s.lastIncomingText = text;
+  await sendMessage(targetId,
+    `💬 <b>В группе "${escapeHtml(msg.chat.title||'Группа')}" вам вопрос:</b>\n<code>${escapeHtml(text)}</code>\n\nПодготовить ответ?`,
+    { parse_mode: "HTML", reply_markup: { inline_keyboard: [
+      [{ text: "✅ Подготовить", callback_data: "group_prepare" }],
+      [{ text: "🚫 Не надо", callback_data: "group_ignore" }],
+    ]}}
+  );
+};
 
-  const groupTitle = sourceMsg?.chat?.title || sourceMsg?.chat?.username || "Группа";
-  const fromName =
-    [sourceMsg?.from?.first_name, sourceMsg?.from?.last_name].filter(Boolean).join(" ") ||
-    sourceMsg?.from?.username ||
-    "Участник";
+// --- Main update processor ---
+const handleCallback = async query => {
+  const { data, message, from } = query;
+  const chatId = message.chat.id, msgId = message.message_id, uid = from.id;
+  await hydrateSession(uid, from.username);
+  const s = getSession(uid);
+  await answerCb(query.id);
 
-  const body =
-    "💬 <b>В группе тебе задали вопрос</b>\n\n" +
-    `👥 <b>${escapeHtml(groupTitle)}</b>\n` +
-    `👤 От: <b>${escapeHtml(fromName)}</b>\n\n` +
-    `Сообщение:\n<code>${escapeHtml(incomingText)}</code>\n\n` +
-    "Подготовить ответ на это сообщение?";
-
-  setSession(targetUserId, {
-    lastIncomingText: incomingText,
-    lastSource: "group",
-    lastGroupChatId: String(sourceMsg?.chat?.id || ""),
-    awaitingInput: false,
-  });
-
-  await sendMessage(targetUserId, body, {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "✅ Подготовить ответ", callback_data: "group_prepare_reply" }],
-        [{ text: "🚫 Не надо", callback_data: "group_no_need" }],
-        [{ text: "🙈 Игнорировать", callback_data: "group_ignore" }],
-      ],
+  const actions = {
+    menu_home: () => editMessage(chatId, msgId, "🤖 Главное меню", { parse_mode:"HTML", reply_markup: homeKb(uid) }),
+    quick_start: () => editMessage(chatId, msgId, "✍️ <b>Подготовить ответ</b>\n\nВыбери режим и введи текст.", { parse_mode:"HTML", reply_markup: quickKb(uid) }),
+    style_start: () => editMessage(chatId, msgId, "🪄 <b>Перефразировать текст</b>\n\nВыбери стиль и введи текст.", { parse_mode:"HTML", reply_markup: styleKb(uid) }),
+    menu_settings: () => editMessage(chatId, msgId, "⚙️ Настройки", { parse_mode:"HTML", reply_markup: { inline_keyboard: [
+      [{ text: "👥 Группы", callback_data: "groups" }],
+      [{ text: "❓ Помощь", callback_data: "help" }],
+      [{ text: "🔄 Онбординг", callback_data: "onboarding" }],
+      [{ text: "⬅ Назад", callback_data: "menu_home" }],
+    ]}}),
+    menu_sub: () => editMessage(chatId, msgId, `💳 Подписка\nСтатус: ${isPremium(s)?`активна до ${s.subscriptionUntil?.slice(0,10)}`:"нет"}`, { parse_mode:"HTML", reply_markup: subKb(uid) }),
+    buy_trial: async () => {
+      if (s.trialUsed) return editMessage(chatId, msgId, "Пробная уже использована.", { reply_markup: subKb(uid) });
+      const until = new Date(); until.setDate(until.getDate()+TRIAL_DAYS);
+      s.subscriptionUntil = until.toISOString(); s.trialUsed = true;
+      await prisma?.user.update({ where:{telegramId:String(uid)}, data:{subscriptionTil:until} }).catch(()=>{});
+      await editMessage(chatId, msgId, `🎁 Пробная активирована до ${until.toISOString().slice(0,10)}`, { reply_markup: homeKb(uid) });
     },
-  });
-}
-
-async function renderHome(chatId, userId, messageId = null) {
-  const username = await resolveBotUsername();
-  const payload = {
-    parse_mode: "HTML",
-    reply_markup: homeKeyboard(userId, username),
+    quick_input: () => { s.awaitingInput = true; sendMessage(chatId, "Пришли сообщение для ответа.", { reply_markup:{inline_keyboard:[[{text:"⬅ Назад", callback_data:"quick_start"}]]} }); },
+    style_input: () => { s.awaitingTransformInput = true; sendMessage(chatId, "Пришли текст для перефразирования."); },
+    quick_use_last: () => s.lastIncomingText && sendDraft(chatId, uid, s.lastIncomingText),
+    style_use_last: () => s.lastTransformInput && processStyle(chatId, uid, s.lastTransformInput),
+    copy_draft: () => sendMessage(chatId, `📋 ${escapeHtml(s.lastDraft)}`, { parse_mode:"HTML" }),
+    copy_style: () => sendMessage(chatId, `📋 ${escapeHtml(s.lastTransformText)}`, { parse_mode:"HTML" }),
+    regen_draft: () => s.lastIncomingText && sendDraft(chatId, uid, s.lastIncomingText),
+    regen_style: () => s.lastTransformInput && processStyle(chatId, uid, s.lastTransformInput),
+    group_prepare: () => s.lastIncomingText && sendDraft(chatId, uid, s.lastIncomingText),
+    group_ignore: () => editMessage(chatId, msgId, "Ок, игнорирую."),
+    groups: async () => {
+      const user = await fallbackUser(uid);
+      const groups = Object.values(user.groups || {});
+      const kb = groups.map(g => ([{ text: `${g.enabled?'✅':'❌'} ${g.title}`, callback_data: `toggle_${g.id}` }]));
+      kb.push([{ text: "⬅ Назад", callback_data: "menu_settings" }]);
+      await editMessage(chatId, msgId, "👥 Группы (вкл/выкл подсказки)", { reply_markup:{inline_keyboard:kb} });
+    },
+    help: () => editMessage(chatId, msgId, "🆘 Помощь:\n/start, /status, /help", { reply_markup:{inline_keyboard:[[{text:"⬅ Назад", callback_data:"menu_settings"}]]} }),
+    onboarding: async () => {
+      await editMessage(chatId, msgId, "Добро пожаловать! Я помогу с ответами.", { reply_markup:{inline_keyboard:[[{text:"🚀 Начать", callback_data:"onb_step2"}]]} });
+    },
+    onb_step2: () => editMessage(chatId, msgId, "1) Нажми «Подготовить ответ»\n2) Выбери режим\n3) Отправь текст", { reply_markup:{inline_keyboard:[[{text:"Дальше", callback_data:"onb_done"}]]} }),
+    onb_done: async () => { await prisma?.user.update({ where:{telegramId:String(uid)}, data:{onboardingCompleted:true} }).catch(()=>{}); return actions.menu_home(); },
   };
-  if (messageId) {
-    return editMessageText(chatId, messageId, buildHomeText(userId), payload);
+
+  if (actions[data]) return actions[data]();
+  if (data.startsWith("mode_")) {
+    const mode = data.slice(5);
+    if (!MODES[mode]) return;
+    if (!isPremium(s) && !["normal","short"].includes(mode)) return answerCb(query.id, { text:"Требуется подписка", show_alert:true });
+    s.mode = mode;
+    return editMessage(chatId, msgId, "✍️ <b>Подготовить ответ</b>", { parse_mode:"HTML", reply_markup: quickKb(uid) });
   }
-  return sendMessage(chatId, buildHomeText(userId), payload);
-}
-
-async function renderQuickStart(chatId, userId, messageId) {
-  setSession(userId, { awaitingInput: true, awaitingTransformInput: false, pendingClarifyText: "" });
-  return editMessageText(chatId, messageId, buildQuickStartText(), {
-    parse_mode: "HTML",
-    reply_markup: quickReplyKeyboard(userId),
-  });
-}
-
-async function renderStyleTool(chatId, userId, messageId) {
-  setSession(userId, { awaitingInput: false, awaitingTransformInput: true });
-  return editMessageText(chatId, messageId, buildStyleStartText(), {
-    parse_mode: "HTML",
-    reply_markup: styleToolKeyboard(userId),
-  });
-}
-
-async function renderSettings(chatId, userId, messageId) {
-  const username = await resolveBotUsername();
-  return editMessageText(chatId, messageId, buildSettingsText(userId), {
-    parse_mode: "HTML",
-    reply_markup: settingsKeyboard(username),
-  });
-}
-
-async function renderHelp(chatId, messageId) {
-  return editMessageText(chatId, messageId, buildHelpText(), {
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: [[{ text: "⬅ Назад", callback_data: "menu_home" }]] },
-  });
-}
-
-async function renderConnect(chatId, userId, messageId) {
-  const groups = await getUserGroups(userId);
-  let text =
-    "👥 <b>Группы (подсказки)</b>\n\n" +
-    "Бот не отправляет сообщения в группы от твоего имени.\n" +
-    "Он подготавливает черновики в личке, а ты отправляешь их сам.\n\n";
-
-  if (!groups.length) {
-    text +=
-      "Пока нет групп в списке.\n\n" +
-      "Что сделать:\n" +
-      "1) Добавь бота в нужную группу\n" +
-      "2) Напиши в группе хотя бы одно сообщение\n" +
-      "3) Вернись сюда и нажми «Обновить»";
-  } else {
-    text += "Выбери группу ниже, чтобы включить или выключить подсказки:";
+  if (data.startsWith("style_")) {
+    const style = data.slice(6);
+    if (!STYLES[style]) return;
+    if (!isPremium(s) && !["neutral","polite"].includes(style)) return answerCb(query.id, { text:"Требуется подписка", show_alert:true });
+    s.transformMode = style;
+    return editMessage(chatId, msgId, "🪄 <b>Перефразировать</b>", { parse_mode:"HTML", reply_markup: styleKb(uid) });
   }
-
-  const keyboard = [];
-  for (const g of groups) {
-    const mark = g.enabled ? "✅" : "❌";
-    keyboard.push([
-      {
-        text: `${mark} ${g.title || "Группа"}`,
-        callback_data: `group_toggle:${g.id}`,
-      },
-    ]);
+  if (data.startsWith("delay_")) {
+    s.delaySec = parseInt(data.slice(6));
+    return editMessage(chatId, msgId, "✍️ <b>Подготовить ответ</b>", { parse_mode:"HTML", reply_markup: quickKb(uid) });
   }
-  keyboard.push([{ text: "🔄 Обновить", callback_data: "connect_refresh" }]);
-  keyboard.push([{ text: "⬅ Назад", callback_data: "menu_settings" }]);
-
-  return editMessageText(chatId, messageId, text, {
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: keyboard },
-  });
-}
-
-async function renderOnboarding(chatId, userId, step = 1, messageId = null) {
-  let text = "";
-  let keyboard = { inline_keyboard: [] };
-
-  if (step === 1) {
-    text =
-      "🤖 <b>Добро пожаловать!</b>\n\n" +
-      "Я помогу быстро готовить ответы в переписке.\n" +
-      "Ты вставляешь сообщение, я даю готовый вариант,\n" +
-      "ты копируешь и отправляешь сам.\n\n" +
-      "Давай покажу, как пользоваться.";
-    keyboard = {
-      inline_keyboard: [
-        [{ text: "🚀 Начать", callback_data: "onb_next_2" }],
-        [{ text: "⏭ Пропустить", callback_data: "onb_done" }],
-      ],
-    };
+  if (data.startsWith("toggle_")) {
+    const gid = data.slice(7);
+    const state = await readState();
+    const grp = state.users[uid]?.groups?.[gid];
+    if (grp) grp.enabled = !grp.enabled; else state.users[uid].groups[gid] = { id:gid, enabled:true };
+    await writeState(state);
+    return actions.groups();
   }
-
-  if (step === 2) {
-    text =
-      "✍️ <b>Как получить первый ответ</b>\n\n" +
-      "1) Нажми «Подготовить ответ»\n" +
-      "2) Выбери режим (обычный/коротко и т.д.)\n" +
-      "3) Нажми «Ввести текст» и отправь сообщение\n\n" +
-      "Я пришлю готовый вариант, который можно сразу отправить.";
-    keyboard = {
-      inline_keyboard: [
-        [{ text: "⬅ Назад", callback_data: "onb_back_1" }],
-        [{ text: "Дальше ➡️", callback_data: "onb_next_3" }],
-      ],
-    };
+  // YooKassa payments
+  if (data.startsWith("buy_")) {
+    const plan = {7:150,30:450,180:1990,365:3184}[data.slice(4)] || 150;
+    const payment = await axios.post(`${YOOKASSA_API}/payments`, {
+      amount:{value:plan, currency:"RUB"}, capture:true,
+      confirmation:{type:"redirect", return_url:`https://t.me/${from.username||""}`},
+      description:`Подписка ${data.slice(4)} дн.`,
+      metadata:{user_id:String(uid)},
+    }, { headers:{ Authorization: `Basic ${Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString("base64")}` }}).catch(()=>null);
+    if (!payment?.data?.confirmation?.confirmation_url) return sendMessage(chatId, "Ошибка создания платежа.");
+    pendingPayments.set(payment.data.id, { uid, days:parseInt(data.slice(4)) });
+    return editMessage(chatId, msgId, `💳 Оплатите ${plan}₽`, { reply_markup:{inline_keyboard:[
+      [{ text: "Оплатить", url: payment.data.confirmation.confirmation_url }],
+      [{ text: "✅ Я оплатил", callback_data: `check_${payment.data.id}` }],
+    ]}});
   }
-
-  if (step === 3) {
-    text =
-      "⚙️ <b>Что ещё важно</b>\n\n" +
-      "• В «Настройках» есть помощь и повтор онбординга\n" +
-      "• В «Подписке» доступны все режимы и тарифы\n" +
-      "• Кнопка «Группы» — для подсказок по чатам\n\n" +
-      "Готово. Можно начинать использовать бота.";
-    keyboard = {
-      inline_keyboard: [
-        [{ text: "⬅ Назад", callback_data: "onb_back_2" }],
-        [{ text: "✅ Поехали", callback_data: "onb_done" }],
-      ],
-    };
-  }
-
-  if (messageId) {
-    return editMessageText(chatId, messageId, text, {
-      parse_mode: "HTML",
-      reply_markup: keyboard,
-    });
-  }
-
-  return sendMessage(chatId, text, {
-    parse_mode: "HTML",
-    reply_markup: keyboard,
-  });
-}
-
-async function handleCommand(message, text) {
-  const chatId = message.chat.id;
-  const userId = message.from?.id;
-  if (!userId) return;
-
-  // Команды обрабатываем только в личке.
-  if (message.chat?.type !== "private") return;
-
-  await ensureUserAndHydrateSession(userId, message.from?.username || null);
-
-  const cmd = text.split(" ")[0].toLowerCase();
-
-  if (cmd === "/start") {
-    const onboardingDone = await getOnboardingCompleted(userId, message.from?.username || null);
-    if (!onboardingDone) return renderOnboarding(chatId, userId, 1);
-    return renderHome(chatId, userId);
-  }
-  if (cmd === "/help") {
-    return sendMessage(chatId, buildHelpText(), {
-      parse_mode: "HTML",
-      reply_markup: {
-        inline_keyboard: [[{ text: "📋 Секретарские команды", callback_data: "help_secretary" }]],
-      },
-    });
-  }
-  if (cmd === "/onboarding") {
-    setSession(userId, { awaitingInput: false });
-    await setOnboardingCompleted(userId, false, message.from?.username || null);
-    return renderOnboarding(chatId, userId, 1);
-  }
-  if (cmd === "/status" || cmd === "/profile") {
-    const s = getSession(userId);
-    const statusText =
-      "📊 <b>Твой профиль</b>\n\n" +
-      `💳 <b>Подписка:</b> ${isPremium(s) ? "✅ активна (пробная)" : "🆓 бесплатный режим"}\n` +
-      `🎨 <b>Режим:</b> ${escapeHtml(MODES[s.mode]?.label || MODES.normal.label)}\n` +
-      `⏱ <b>Задержка:</b> ${s.delaySec} сек`;
-    return sendMessage(chatId, statusText, { parse_mode: "HTML" });
-  }
-  if (cmd === "/admin") {
-    if (!isAdmin(userId)) {
-      return sendMessage(
-        chatId,
-        `⛔ Нет доступа.\nТвой Telegram ID: <code>${escapeHtml(String(userId))}</code>`,
-        { parse_mode: "HTML" }
-      );
-    }
-
-    const state = await readStateFile();
-    const users = Object.values(state?.users || {});
-    const now = Date.now();
-
-    const total = users.length;
-    const withSub = users.filter((u) => {
-      const dt = new Date(u?.subscriptionTil || 0).getTime();
-      return Number.isFinite(dt) && dt > now;
-    }).length;
-    const withTrial = users.filter((u) => Boolean(u?.trialUsed)).length;
-
-    const rows = users
-      .slice(0, 25)
-      .map((u) => {
-        const uname = u?.username ? `@${u.username}` : "без username";
-        const subOk = (() => {
-          const dt = new Date(u?.subscriptionTil || 0).getTime();
-          return Number.isFinite(dt) && dt > now;
-        })();
-        return `• ${u.telegramId} (${uname}) ${subOk ? "✅ sub" : "🆓"}`;
-      })
-      .join("\n");
-
-    const textOut =
-      "🛠 <b>Админ-панель</b>\n\n" +
-      `👥 Пользователей: <b>${total}</b>\n` +
-      `💳 Активных подписок: <b>${withSub}</b>\n` +
-      `🎁 Использовали trial: <b>${withTrial}</b>\n\n` +
-      (rows ? "<b>Последние пользователи:</b>\n" + rows : "Пока нет пользователей.");
-
-    return sendMessage(chatId, textOut, { parse_mode: "HTML" });
-  }
-}
-
-async function handleCallback(query) {
-  const data = query.data;
-  const chatId = query.message?.chat?.id;
-  const messageId = query.message?.message_id;
-  const userId = query.from?.id;
-  if (!data || !chatId || !messageId || !userId) return;
-  await ensureUserAndHydrateSession(userId, query.from?.username || null);
-
-  await answerCallbackQuery(query.id);
-
-  if (data === "group_prepare_reply") {
-    const s = getSession(userId);
-    if (!s.lastIncomingText) {
-      return editMessageText(
-        chatId,
-        messageId,
-        "Не нашёл исходное сообщение. Пришли текст вручную через «Подготовить ответ».",
-        {
-          reply_markup: { inline_keyboard: [[{ text: "✍️ Подготовить ответ", callback_data: "quick_reply_start" }]] },
-        }
-      );
-    }
-    return handleDraftRequest({ chatId, userId, incomingText: s.lastIncomingText });
-  }
-
-  if (data === "group_no_need") {
-    return editMessageText(chatId, messageId, "Ок, не готовлю ответ на это сообщение.", {
-      reply_markup: { inline_keyboard: [[{ text: "🏠 Главное меню", callback_data: "menu_home" }]] },
-    });
-  }
-
-  if (data === "group_ignore") {
-    setSession(userId, { lastIncomingText: "" });
-    return editMessageText(chatId, messageId, "Принято. Игнорирую это сообщение.", {
-      reply_markup: { inline_keyboard: [[{ text: "🏠 Главное меню", callback_data: "menu_home" }]] },
-    });
-  }
-
-  if (data === "onb_next_2") return renderOnboarding(chatId, userId, 2, messageId);
-  if (data === "onb_next_3") return renderOnboarding(chatId, userId, 3, messageId);
-  if (data === "onb_back_1") return renderOnboarding(chatId, userId, 1, messageId);
-  if (data === "onb_back_2") return renderOnboarding(chatId, userId, 2, messageId);
-  if (data === "onb_done" || data === "onb_skip") {
-    await setOnboardingCompleted(userId, true, query.from?.username || null);
-    return renderHome(chatId, userId, messageId);
-  }
-
-  if (data === "menu_home") return renderHome(chatId, userId, messageId);
-  if (data === "quick_reply_start") return renderQuickStart(chatId, userId, messageId);
-  if (data === "style_text_start") return renderStyleTool(chatId, userId, messageId);
-  if (data === "quick_input") {
-    setSession(userId, { awaitingInput: true, awaitingTransformInput: false, pendingClarifyText: "" });
-    return sendMessage(
-      chatId,
-      "✍️ <b>Ввести текст</b>\n\nПришли одно сообщение, на которое нужно подготовить ответ.",
-      {
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "⬅ Назад", callback_data: "quick_reply_start" }],
-            [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
-          ],
-        },
-      }
-    );
-  }
-
-  if (data === "quick_add_details") {
-    setSession(userId, { awaitingInput: true, awaitingTransformInput: false });
-    return sendMessage(
-      chatId,
-      "🧩 <b>Добавь детали к текущему сообщению</b>\n\n" +
-        "Напиши, что важно учесть: сроки, сумма, условия, желаемый тон.",
-      {
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "⚡ Сгенерировать как есть", callback_data: "quick_force_generate" }],
-            [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
-          ],
-        },
-      }
-    );
-  }
-
-  if (data === "style_input") {
-    setSession(userId, { awaitingTransformInput: true, awaitingInput: false });
-    return sendMessage(
-      chatId,
-      "🎨 <b>Ввести текст</b>\n\nПришли текст, который нужно обработать под выбранный стиль.",
-      {
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "⬅ Назад", callback_data: "style_text_start" }],
-            [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
-          ],
-        },
-      }
-    );
-  }
-
-  if (data === "quick_use_last") {
-    const s = getSession(userId);
-    if (!s.lastIncomingText) {
-      return sendMessage(chatId, "Нет последнего сообщения. Нажми «✍️ Ввести текст».", {
-        reply_markup: { inline_keyboard: [[{ text: "✍️ Ввести текст", callback_data: "quick_input" }]] },
-      });
-    }
-    return handleDraftRequest({ chatId, userId, incomingText: s.lastIncomingText });
-  }
-
-  if (data === "quick_force_generate") {
-    const s = getSession(userId);
-    const src = String(s.pendingClarifyText || s.lastIncomingText || "").trim();
-    if (!src) {
-      return sendMessage(chatId, "Не нашёл текст для генерации. Нажми «✍️ Ввести текст».", {
-        reply_markup: { inline_keyboard: [[{ text: "✍️ Ввести текст", callback_data: "quick_input" }]] },
-      });
-    }
-    return handleDraftRequest({ chatId, userId, incomingText: src, force: true });
-  }
-
-  if (data === "quick_copy") {
-    const s = getSession(userId);
-    if (!s.lastDraft) {
-      return answerCallbackQuery(query.id, { text: "Черновика еще нет", show_alert: true });
-    }
-    return sendMessage(chatId, "📋 <b>Текст для копирования:</b>\n\n" + escapeHtml(s.lastDraft), {
-      parse_mode: "HTML",
-      reply_markup: draftResultKeyboard(userId),
-    });
-  }
-
-  if (data === "style_copy") {
-    const s = getSession(userId);
-    if (!s.lastTransformText) {
-      return answerCallbackQuery(query.id, { text: "Текста еще нет", show_alert: true });
-    }
-    return sendMessage(chatId, "📋 <b>Текст для копирования:</b>\n\n" + escapeHtml(s.lastTransformText), {
-      parse_mode: "HTML",
-      reply_markup: styleResultKeyboard(userId),
-    });
-  }
-
-  if (data === "quick_reply_regen") {
-    const s = getSession(userId);
-    if (!s.lastIncomingText) {
-      return answerCallbackQuery(query.id, { text: "Сначала пришли текст", show_alert: true });
-    }
-    return sendDraftWithDelay({ chatId, userId, incomingText: s.lastIncomingText });
-  }
-
-  if (data === "style_regen") {
-    const s = getSession(userId);
-    if (!s.lastTransformInput) {
-      return answerCallbackQuery(query.id, { text: "Сначала пришли текст", show_alert: true });
-    }
-    return processStyledText({ chatId, userId, incomingText: s.lastTransformInput });
-  }
-
-  if (data === "style_use_last") {
-    const s = getSession(userId);
-    if (!s.lastTransformInput) {
-      return sendMessage(chatId, "Нет последнего текста. Нажми «✍️ Ввести текст».", {
-        reply_markup: { inline_keyboard: [[{ text: "✍️ Ввести текст", callback_data: "style_input" }]] },
-      });
-    }
-    return processStyledText({ chatId, userId, incomingText: s.lastTransformInput });
-  }
-
-  if (data.startsWith("quick_delay_")) {
-    const delay = Number(data.replace("quick_delay_", ""));
-    if (delay === 10 || delay === 20) {
-      setSession(userId, { delaySec: delay });
-      await answerCallbackQuery(query.id, { text: `Задержка: ${delay} сек` });
-    }
-    return editMessageText(chatId, messageId, buildQuickStartText(), {
-      parse_mode: "HTML",
-      reply_markup: quickReplyKeyboard(userId),
-    });
-  }
-
-  if (data.startsWith("quick_mode_")) {
-    const nextMode = data.replace("quick_mode_", "");
-    const s = getSession(userId);
-    if (!MODES[nextMode]) return;
-
-    if (!isPremium(s) && !["normal", "short"].includes(nextMode)) {
-      return editMessageText(
-        chatId,
-        messageId,
-        "🔒 <b>Режимы доступны по подписке</b>\n\nОткрой пробную подписку за 0 ₽, чтобы включить расширенные режимы.",
-        { parse_mode: "HTML", reply_markup: subKeyboard(userId) }
-      );
-    }
-
-    setSession(userId, { mode: nextMode });
-    await answerCallbackQuery(query.id, { text: `Режим: ${MODES[nextMode].label}` });
-    return editMessageText(chatId, messageId, buildQuickStartText(), {
-      parse_mode: "HTML",
-      reply_markup: quickReplyKeyboard(userId),
-    });
-  }
-
-  if (data.startsWith("style_mode_")) {
-    const nextMode = data.replace("style_mode_", "");
-    const s = getSession(userId);
-    if (!STYLE_MODES[nextMode]) return;
-
-    if (
-      !isPremium(s) &&
-      ![PARAPHRASE_STYLE.NEUTRAL, PARAPHRASE_STYLE.POLITE].includes(nextMode)
-    ) {
-      return editMessageText(
-        chatId,
-        messageId,
-        "🔒 <b>Режимы доступны по подписке</b>\n\nОткрой пробную подписку за 0 ₽, чтобы включить расширенные стили.",
-        { parse_mode: "HTML", reply_markup: subKeyboard(userId) }
-      );
-    }
-
-    setSession(userId, { transformMode: nextMode });
-    await answerCallbackQuery(query.id, { text: `Стиль: ${STYLE_MODES[nextMode].label}` });
-    return editMessageText(chatId, messageId, buildStyleStartText(), {
-      parse_mode: "HTML",
-      reply_markup: styleToolKeyboard(userId),
-    });
-  }
-
-  if (data === "menu_settings") return renderSettings(chatId, userId, messageId);
-  if (data === "help_how") return renderHelp(chatId, messageId);
-  if (data === "connect_chat" || data === "connect_refresh") return renderConnect(chatId, userId, messageId);
-  if (data.startsWith("group_toggle:")) {
-    const groupId = data.replace("group_toggle:", "").trim();
-    const groups = await getUserGroups(userId);
-    const row = groups.find((g) => String(g.id) === String(groupId));
-    const nextEnabled = row ? !Boolean(row.enabled) : true;
-    await setGroupEnabledForUser(userId, groupId, nextEnabled);
-    await answerCallbackQuery(query.id, { text: nextEnabled ? "✅ Включено" : "❌ Выключено" });
-    return renderConnect(chatId, userId, messageId);
-  }
-  if (data === "menu_sub") {
-    return editMessageText(chatId, messageId, buildSubText(userId), {
-      parse_mode: "HTML",
-      reply_markup: subKeyboard(userId),
-    });
-  }
-  if (data === "sub_benefits") {
-    return editMessageText(
-      chatId,
-      messageId,
-      "✨ <b>Что даёт подписка</b>\n\n" +
-        "• ♾️ безлимит на черновики\n" +
-        "• 🎯 все режимы ответа: Вежливо, По делу, Отказать, Занят\n" +
-        "• 🔄 больше вариантов на одно сообщение\n" +
-        "• ⚡ приоритет генерации\n" +
-        "• 🧾 история и логи",
-      {
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [
-            ...(!getSession(userId).trialUsed ? [[{ text: "🎁 Пробная — 0 ₽", callback_data: "buy_trial" }]] : []),
-            [{ text: "⬅ Назад", callback_data: "menu_sub" }],
-          ],
-        },
-      }
-    );
-  }
-  if (data === "buy_trial") {
-    const s = getSession(userId);
-    if (s.trialUsed) {
-      return editMessageText(
-        chatId,
-        messageId,
-        "ℹ️ <b>Пробная подписка уже использована.</b>\n\nВыбери один из платных тарифов ниже.",
-        {
-          parse_mode: "HTML",
-          reply_markup: subKeyboard(userId),
-        }
-      );
-    }
-    const until = await activateSubscription(userId, TRIAL_DAYS, query.from?.username || null);
-    await markTrialUsed(userId, query.from?.username || null);
-    setSession(userId, { trialUsed: true });
-    return editMessageText(
-      chatId,
-      messageId,
-      `🎁 <b>Пробная подписка активирована</b>\n\nПробный период: ${TRIAL_DAYS} дня.\nАктивна до ${formatShortDate(until)}.\nТеперь доступны все режимы ответов.`,
-      {
-        parse_mode: "HTML",
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "✍️ Подготовить ответ", callback_data: "quick_reply_start" }],
-            [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
-          ],
-        },
-      }
-    );
-  }
-  if (data.startsWith("pay_check:")) {
-    const paymentId = data.replace("pay_check:", "").trim();
-    if (!paymentId) return;
-
-    const pending = pendingPayments.get(paymentId);
-    if (!pending || pending.userId !== String(userId)) {
-      return editMessageText(
-        chatId,
-        messageId,
-        "⚠️ Платёж не найден в текущей сессии.\n\nОткрой «Подписка» и создай оплату заново.",
-        {
-          parse_mode: "HTML",
-          reply_markup: { inline_keyboard: [[{ text: "⬅️ К подписке", callback_data: "menu_sub" }]] },
-        }
-      );
-    }
-
-    try {
-      const payment = await getYooPayment(paymentId);
-      const status = String(payment?.status || "");
-
-      if (status !== "succeeded") {
-        return editMessageText(
-          chatId,
-          messageId,
-          "⏳ <b>Оплата ещё не завершена</b>\n\n" +
-            `Статус: <b>${escapeHtml(status || "pending")}</b>\n` +
-            "Если ты уже оплатил, нажми «Проверить ещё раз».",
-          {
-            parse_mode: "HTML",
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: "🔄 Проверить ещё раз", callback_data: `pay_check:${paymentId}` }],
-                [{ text: "⬅️ К подписке", callback_data: "menu_sub" }],
-              ],
-            },
-          }
-        );
-      }
-
-      const until = await activateSubscription(userId, pending.days, query.from?.username || null);
-      pendingPayments.delete(paymentId);
-
-      return editMessageText(
-        chatId,
-        messageId,
-        "✅ <b>Оплата прошла</b>\n\n" +
-          `Тариф: <b>${escapeHtml(pending.title)}</b>\n` +
-          `Подписка активна до: <b>${formatUsDate(until)}</b>`,
-        {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "💳 Открыть подписку", callback_data: "menu_sub" }],
-              [{ text: "🏠 Главное меню", callback_data: "menu_home" }],
-            ],
-          },
-        }
-      );
-    } catch (e) {
-      console.error("pay_check error:", e?.response?.data || e?.message || e);
-      return editMessageText(
-        chatId,
-        messageId,
-        "❌ Не удалось проверить оплату.\nПопробуй снова через несколько секунд.",
-        {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "🔄 Проверить ещё раз", callback_data: `pay_check:${paymentId}` }],
-              [{ text: "⬅️ К подписке", callback_data: "menu_sub" }],
-            ],
-          },
-        }
-      );
+  if (data.startsWith("check_")) {
+    const pid = data.slice(6);
+    const payment = await axios.get(`${YOOKASSA_API}/payments/${pid}`, {
+      headers:{ Authorization: `Basic ${Buffer.from(`${YOOKASSA_SHOP_ID}:${YOOKASSA_SECRET_KEY}`).toString("base64")}` }
+    }).catch(()=>null);
+    if (payment?.data?.status !== "succeeded") return answerCb(query.id, { text:"Оплата не завершена", show_alert:true });
+    const pending = pendingPayments.get(pid);
+    if (pending) {
+      const until = new Date(); until.setDate(until.getDate()+pending.days);
+      s.subscriptionUntil = until.toISOString();
+      await prisma?.user.update({ where:{telegramId:String(uid)}, data:{subscriptionTil:until} }).catch(()=>{});
+      pendingPayments.delete(pid);
+      return editMessage(chatId, msgId, `✅ Подписка активирована до ${until.toISOString().slice(0,10)}`, { reply_markup: homeKb(uid) });
     }
   }
-  if (["buy_7", "buy_30", "buy_180", "buy_365"].includes(data)) {
-    const plan = getTariffByAction(data);
-    if (!plan) return;
-    const username = await resolveBotUsername();
+};
 
-    try {
-      const payment = await createYooPayment({ userId, plan, username });
-      return editMessageText(
-        chatId,
-        messageId,
-        "💳 <b>Оплата тарифа</b>\n\n" +
-          `Тариф: <b>${plan.title}</b>\n` +
-          `Стоимость: <b>${plan.price} ₽</b>\n\n` +
-          "Нажми «Оплатить», затем вернись и нажми «Я оплатил».",
-        {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "💳 Оплатить", url: payment.confirmation.confirmation_url }],
-              [{ text: "✅ Я оплатил", callback_data: `pay_check:${payment.id}` }],
-              [{ text: "⬅️ К подписке", callback_data: "menu_sub" }],
-            ],
-          },
-        }
-      );
-    } catch (e) {
-      console.error("create payment error:", e?.response?.data || e?.message || e);
-      return editMessageText(
-        chatId,
-        messageId,
-        "❌ Не удалось создать оплату.\nПроверь настройки YooKassa и попробуй снова.",
-        {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "🔄 Обновить", callback_data: "menu_sub" }],
-              [{ text: "⬅️ К подписке", callback_data: "menu_sub" }],
-            ],
-          },
-        }
-      );
-    }
-  }
-  if (data === "onboarding_restart") {
-    setSession(userId, { awaitingInput: false });
-    await setOnboardingCompleted(userId, false, query.from?.username || null);
-    return renderOnboarding(chatId, userId, 1, messageId);
-  }
-  if (data === "help_secretary") {
-    return editMessageText(
-      chatId,
-      messageId,
-      "📋 <b>Секретарские команды</b>\n\n• ответь вежливо\n• ответь коротко\n• ответь по делу\n• откажи вежливо\n• скажи, что занят",
-      {
-        parse_mode: "HTML",
-        reply_markup: { inline_keyboard: [[{ text: "⬅ Назад", callback_data: "help_how" }]] },
-      }
-    );
-  }
-}
-
-async function handleMessage(message) {
-  const chatId = message.chat?.id;
-  const userId = message.from?.id;
-  const text = message.text?.trim();
-  if (!chatId || !userId) return;
-
-  // ============================
-  // GROUP SILENT ASSIST
-  // Ничего не пишем в группу, только сигналим в личку адресату.
-  // ============================
-  if (message.chat?.type === "group" || message.chat?.type === "supergroup") {
-    const incomingText = String(message.text || message.caption || "").trim();
-    if (!incomingText) return;
-
-    cacheUsername(message.from);
-    cacheUsername(message.reply_to_message?.from);
-
-    // Сохраняем группу для автора сообщения (чтобы видел у себя список групп).
-    await fallbackUpsertGroupForUser(message.from.id, message.chat);
-
-    let targetUserId = null;
-    if (message.reply_to_message?.from?.id && !message.reply_to_message?.from?.is_bot) {
-      targetUserId = Number(message.reply_to_message.from.id);
-    }
-    if (!targetUserId) {
-      targetUserId = extractMentionedUserId(message, incomingText);
-    }
-    if (!targetUserId) return;
-    if (Number(targetUserId) === Number(message.from?.id)) return;
-
-    await ensureUserAndHydrateSession(targetUserId, message.reply_to_message?.from?.username || null);
-    await fallbackUpsertGroupForUser(targetUserId, message.chat);
-
-    const enabledForTarget = await isGroupEnabledForUser(targetUserId, message.chat.id);
-    if (!enabledForTarget) return;
-
-    const targetState = getSession(targetUserId);
-
-    // По продуктовой логике — фича для подписки/пробной.
-    if (!isPremium(targetState)) return;
-
-    await notifyGroupQuestionToUser({
-      targetUserId,
-      sourceMsg: message,
-      incomingText,
-    });
+const handleMessage = async msg => {
+  const chatId = msg.chat.id, uid = msg.from.id, text = msg.text?.trim();
+  if (!uid) return;
+  cacheUsername(msg.from);
+  if (msg.chat.type !== "private") {
+    // Group handling
+    if (!text) return;
+    const target = msg.reply_to_message?.from?.id || (msg.entities?.find(e=>e.type==="mention")?.user?.id);
+    if (!target || target === uid) return;
+    await hydrateSession(target);
+    const user = await fallbackUser(target);
+    const enabled = user.groups?.[String(chatId)]?.enabled !== false;
+    if (enabled) await notifyGroup(target, msg, text);
     return;
   }
-
-  if (!text) return;
-  await ensureUserAndHydrateSession(userId, message.from?.username || null);
-
-  if (message.chat?.type === "private") {
-    await ensureReplyKeyboardRemoved(chatId, userId);
-  }
-
-  if (text.startsWith("/")) {
-    await handleCommand(message, text);
+  // Private
+  await hydrateSession(uid, msg.from.username);
+  if (text?.startsWith("/")) {
+    if (text === "/start") return sendMessage(chatId, "Главное меню", { reply_markup: homeKb(uid) });
+    if (text === "/status") return sendMessage(chatId, `Статус: ${isPremium(getSession(uid))?"премиум":"бесплатно"}`);
     return;
   }
+  const s = getSession(uid);
+  if (s.awaitingInput) { s.awaitingInput = false; return sendDraft(chatId, uid, text); }
+  if (s.awaitingTransformInput) { s.awaitingTransformInput = false; return processStyle(chatId, uid, text); }
+};
 
-  if (message.chat.type !== "private") return;
-
-  const s = getSession(userId);
-  if (s.awaitingInput) {
-    const base = String(s.pendingClarifyText || "").trim();
-    const incomingText = base
-      ? `${base}\n\nДополнительные детали пользователя:\n${text}`
-      : text;
-    await handleDraftRequest({ chatId, userId, incomingText });
-    return;
-  }
-  if (s.awaitingTransformInput) {
-    await processStyledText({ chatId, userId, incomingText: text });
-    return;
-  }
-}
-
-async function processUpdate(update) {
-  try {
-    if (update?.callback_query) {
-      await handleCallback(update.callback_query);
-      return;
-    }
-    if (update?.message) {
-      await handleMessage(update.message);
-      return;
-    }
-  } catch (err) {
-    console.error("update handler error:", err?.response?.data || err?.message || err);
-  }
-}
-
-async function startPolling() {
-  let offset = 0;
-
-  try {
-    await tg("deleteWebhook", { drop_pending_updates: false });
-    console.log("Telegram mode: polling (webhook disabled)");
-  } catch (e) {
-    console.error("deleteWebhook error:", e?.response?.data || e?.message || e);
-  }
-
-  while (true) {
-    try {
-      const updates = await tg("getUpdates", {
-        offset,
-        timeout: 30,
-        allowed_updates: ["message", "callback_query"],
-      });
-
-      if (Array.isArray(updates) && updates.length) {
-        for (const upd of updates) {
-          offset = Number(upd.update_id) + 1;
-          await processUpdate(upd);
-        }
-      }
-    } catch (e) {
-      console.error("polling error:", e?.response?.data || e?.message || e);
-      await new Promise((r) => setTimeout(r, 1500));
-    }
-  }
-}
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
+// --- Server & polling ---
 app.post(`/webhook/${TELEGRAM_WEBHOOK_SECRET}`, async (req, res) => {
-  res.status(200).json({ ok: true });
-
-  const update = req.body;
-  await processUpdate(update);
+  res.sendStatus(200);
+  const upd = req.body;
+  if (upd.callback_query) await handleCallback(upd.callback_query);
+  if (upd.message) await handleMessage(upd.message);
 });
 
 app.listen(PORT, async () => {
-  await resolveBotUsername();
-  if (TELEGRAM_MODE === "webhook") {
-    await ensureWebhook();
-    console.log("Telegram mode: webhook");
+  if (TELEGRAM_MODE === "webhook" && PUBLIC_URL) {
+    await tg("setWebhook", { url: `${PUBLIC_URL}/webhook/${TELEGRAM_WEBHOOK_SECRET}` });
+    console.log("Webhook set");
   } else {
-    startPolling().catch((e) => {
-      console.error("startPolling fatal:", e?.message || e);
-    });
+    console.log("Polling mode");
+    let offset = 0;
+    while (true) {
+      try {
+        const updates = await tg("getUpdates", { offset, timeout: 30 });
+        for (const upd of updates) {
+          offset = upd.update_id + 1;
+          if (upd.callback_query) await handleCallback(upd.callback_query);
+          if (upd.message) await handleMessage(upd.message);
+        }
+      } catch (e) { await new Promise(r=>setTimeout(r,1000)); }
+    }
   }
-  console.log(`Server listening on port ${PORT}`);
-  console.log(`Webhook endpoint: /webhook/${TELEGRAM_WEBHOOK_SECRET}`);
-});
-
-async function shutdown(signal) {
-  try {
-    console.log(`Received ${signal}, disconnecting prisma...`);
-    await prisma.$disconnect();
-  } catch {}
-  process.exit(0);
-}
-
-process.on("SIGINT", () => {
-  shutdown("SIGINT");
-});
-process.on("SIGTERM", () => {
-  shutdown("SIGTERM");
+  console.log(`Listening on ${PORT}`);
 });
