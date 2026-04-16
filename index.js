@@ -4,8 +4,15 @@ import axios from "axios";
 import OpenAI from "openai";
 import fs from "node:fs/promises";
 import path from "node:path";
-import pkg from '@prisma/client';
-const { PrismaClient } = pkg;
+
+// Динамический импорт PrismaClient с fallback
+let PrismaClient = null;
+try {
+  const prismaModule = await import("@prisma/client");
+  PrismaClient = prismaModule.PrismaClient;
+} catch (e) {
+  console.warn("Prisma client not available, using file fallback.");
+}
 
 // === Конфигурация ===
 const {
