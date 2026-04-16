@@ -4,7 +4,8 @@ import axios from "axios";
 import OpenAI from "openai";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { PrismaClient } from "@prisma/client";
+import pkg from '@prisma/client';
+const { PrismaClient } = pkg;
 
 // === Конфигурация ===
 const {
